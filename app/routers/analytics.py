@@ -1,11 +1,14 @@
 # app/routers/analytics.py
+
 from datetime import date
 from typing import List
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
+
 from app.db import get_db
+from app.deps import get_current_user_id  # use the existing dependency
 from app.models import Transaction
-from app.auth_dep import get_current_user  # whatever you use for auth
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -14,8 +17,8 @@ router = APIRouter(prefix="/analytics", tags=["analytics"])
 def get_spending_summary(
     month: int,
     year: int,
+    user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
 ):
     """
     Basic numeric summary for a month – this is what your AI layer will read.
@@ -29,9 +32,9 @@ def get_spending_summary(
     txs: List[Transaction] = (
         db.query(Transaction)
         .filter(
-            Transaction.user_id == current_user.id,
-            Transaction.date >= start,
-            Transaction.date < end,
+            Transaction.user_id == user_id,
+            Transaction.transaction_date >= start,
+            Transaction.transaction_date < end,
         )
         .all()
     )
@@ -47,7 +50,8 @@ def get_spending_summary(
 
     by_vendor = {}
     for t in txs:
-        name = (t.vendor_name or t.raw_merchant or "Unknown").strip()
+        # Transactions store canonical vendor name in .vendor
+        name = (t.vendor or "Unknown").strip()
         by_vendor.setdefault(name, 0.0)
         if t.amount is not None:
             by_vendor[name] += t.amount
