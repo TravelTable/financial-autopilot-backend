@@ -1,15 +1,7 @@
 from fastapi import FastAPI
 
-from app.routers import (
-    auth,
-    sync,
-    transactions,
-    subscriptions,
-    refunds,
-    privacy,
-    analytics,
-    notifications,
-)
+from app.routers import auth, sync, transactions, subscriptions, refunds, privacy
+from app.routers import analytics, notifications  # direct imports = no __init__.py issues
 
 app = FastAPI(
     title="Financial Autopilot Backend",
