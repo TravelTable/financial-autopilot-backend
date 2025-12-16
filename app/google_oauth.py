@@ -15,24 +15,20 @@ async def exchange_server_auth_code(server_auth_code: str) -> dict[str, Any]:
     """
     Exchanges a Google serverAuthCode for access/refresh tokens.
     Logs full Google error responses to stdout so Railway captures them.
+
+    IMPORTANT:
+    For iOS serverAuthCode flows, including redirect_uri often causes
+    redirect_uri_mismatch. We intentionally omit redirect_uri here.
     """
 
     # ---- ENV VAR SANITY CHECK ----
-    if (
-        not settings.GOOGLE_CLIENT_ID
-        or not settings.GOOGLE_CLIENT_SECRET
-        or not settings.GOOGLE_REDIRECT_URI
-    ):
+    if not settings.GOOGLE_CLIENT_ID or not settings.GOOGLE_CLIENT_SECRET:
         print("❌ Missing Google OAuth env vars")
         print("GOOGLE_CLIENT_ID:", bool(settings.GOOGLE_CLIENT_ID))
         print("GOOGLE_CLIENT_SECRET:", bool(settings.GOOGLE_CLIENT_SECRET))
-        print("GOOGLE_REDIRECT_URI:", settings.GOOGLE_REDIRECT_URI)
-        raise GoogleOAuthError(
-            "Missing Google OAuth env vars (client id/secret/redirect uri)."
-        )
+        raise GoogleOAuthError("Missing Google OAuth env vars (client id/secret).")
 
     print("▶️ Starting Google token exchange")
-    print("Redirect URI:", settings.GOOGLE_REDIRECT_URI)
     print(
         "Client ID prefix:",
         settings.GOOGLE_CLIENT_ID[:12] + "..."
@@ -40,11 +36,11 @@ async def exchange_server_auth_code(server_auth_code: str) -> dict[str, Any]:
         else "missing",
     )
 
+    # NOTE: redirect_uri intentionally omitted to avoid redirect_uri_mismatch
     data = {
         "code": server_auth_code,
         "client_id": settings.GOOGLE_CLIENT_ID,
         "client_secret": settings.GOOGLE_CLIENT_SECRET,
-        "redirect_uri": settings.GOOGLE_REDIRECT_URI,
         "grant_type": "authorization_code",
     }
 
@@ -88,8 +84,6 @@ async def fetch_userinfo(access_token: str) -> dict[str, Any]:
         print("⬅️ Google userinfo body:", resp.text)
 
         if resp.status_code != 200:
-            raise GoogleOAuthError(
-                f"Userinfo failed: {resp.status_code} {resp.text}"
-            )
+            raise GoogleOAuthError(f"Userinfo failed: {resp.status_code} {resp.text}")
 
         return resp.json()
