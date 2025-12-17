@@ -1,12 +1,35 @@
-from fastapi import FastAPI
+ from fastapi import FastAPI
 
-from app.routers import auth, sync, transactions, subscriptions, refunds, privacy
-from app.routers import analytics, notifications  # direct imports = no __init__.py issues
+from app.routers import (
+    auth,
+    sync,
+    transactions,
+    subscriptions,
+    refunds,
+    privacy,
+    analytics,
+    notifications,
+)
+
+# --- DATABASE ---
+from app.db import engine
+from app.models import Base  # Base = declarative_base()
+import app.models  # IMPORTANT: ensures all models (User, etc.) are registered
 
 app = FastAPI(
     title="Financial Autopilot Backend",
     version="0.2.0",
 )
+
+# --- CREATE TABLES ON STARTUP ---
+@app.on_event("startup")
+def on_startup():
+    """
+    Ensures all database tables exist.
+    Safe to run multiple times.
+    Fixes: psycopg2.errors.UndefinedTable
+    """
+    Base.metadata.create_all(bind=engine)
 
 # --- Core ---
 app.include_router(auth.router)
