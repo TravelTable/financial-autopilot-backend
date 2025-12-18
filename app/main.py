@@ -3,6 +3,9 @@ import logging
 import sys
 import os
 
+from sqlalchemy import text
+from sqlalchemy.exc import ProgrammingError
+
 from app.routers import (
     auth,
     sync,
@@ -22,12 +25,6 @@ import app.models  # IMPORTANT: ensures all models (User, etc.) are registered
 
 
 def configure_logging() -> None:
-    """
-    Railway-friendly logging:
-    - logs to stdout
-    - unbuffered / immediate visibility
-    - respects LOG_LEVEL env var
-    """
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     level = getattr(logging, level_name, logging.INFO)
 
@@ -48,17 +45,42 @@ app = FastAPI(
 )
 
 
+def _ensure_bigint_internal_date_ms() -> None:
+    """
+    Gmail 'internalDate' is epoch milliseconds (e.g. 1766020775000),
+    which overflows a 32-bit INTEGER. We must use BIGINT.
+    This function safely upgrades the DB column type if needed.
+    """
+    try:
+        with engine.begin() as conn:
+            # Only attempt the alter if table/column exists.
+            # If it's already BIGINT, Postgres will allow it or no-op depending on type.
+            conn.execute(text("""
+                ALTER TABLE emails_index
+                ALTER COLUMN internal_date_ms TYPE BIGINT
+                USING internal_date_ms::bigint
+            """))
+        logger.info("startup: ensured emails_index.internal_date_ms is BIGINT")
+    except ProgrammingError as e:
+        # Table might not exist yet on first run, or column might not exist if schema differs.
+        logger.warning("startup: could not alter emails_index.internal_date_ms to BIGINT (%s)", str(e))
+    except Exception as e:
+        logger.exception("startup: failed ensuring BIGINT for internal_date_ms: %s", str(e))
+
+
 # --- CREATE TABLES ON STARTUP ---
 @app.on_event("startup")
 def on_startup():
     """
     Ensures all database tables exist.
     Safe to run multiple times.
-    Fixes: psycopg2.errors.UndefinedTable
     """
     logger.info("startup: creating tables if needed")
     Base.metadata.create_all(bind=engine)
     logger.info("startup: tables ensured")
+
+    # ✅ Critical schema fix for Gmail internalDate (ms epoch)
+    _ensure_bigint_internal_date_ms()
 
 
 # --- Core ---
@@ -94,8 +116,5 @@ def health():
 
 @app.get("/debug/logtest", tags=["debug"])
 def logtest():
-    """
-    Hit this endpoint to confirm logs show up in the *web service* logs.
-    """
     logger.info("debug/logtest hit ✅")
     return {"ok": True, "logged": True}
