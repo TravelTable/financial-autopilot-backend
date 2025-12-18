@@ -1,21 +1,35 @@
 import enum
 from datetime import datetime, date
 from sqlalchemy import (
-    String, DateTime, Boolean, Integer, ForeignKey, Numeric, Text, UniqueConstraint, Enum, Date, JSON
+    String,
+    DateTime,
+    Boolean,
+    Integer,
+    BigInteger,   # ✅ ADD
+    ForeignKey,
+    Numeric,
+    Text,
+    UniqueConstraint,
+    Enum,
+    Date,
+    JSON,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db import Base
+
 
 class SubscriptionStatus(str, enum.Enum):
     active = "active"
     canceled = "canceled"
     ignored = "ignored"
 
+
 class NotificationType(str, enum.Enum):
     trial = "trial"
     renewal = "renewal"
     price_increase = "price_increase"
     anomaly = "anomaly"
+
 
 class User(Base):
     __tablename__ = "users"
@@ -27,6 +41,7 @@ class User(Base):
     transactions = relationship("Transaction", back_populates="user", cascade="all, delete-orphan")
     subscriptions = relationship("Subscription", back_populates="user", cascade="all, delete-orphan")
     notifications = relationship("Notification", back_populates="user", cascade="all, delete-orphan")
+
 
 class GoogleAccount(Base):
     __tablename__ = "google_accounts"
@@ -50,6 +65,7 @@ class GoogleAccount(Base):
 
     __table_args__ = (UniqueConstraint("user_id", "google_user_id", name="uq_user_google"),)
 
+
 class EmailIndex(Base):
     __tablename__ = "emails_index"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -57,7 +73,10 @@ class EmailIndex(Base):
 
     gmail_message_id: Mapped[str] = mapped_column(String(128), index=True)
     gmail_thread_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    internal_date_ms: Mapped[int] = mapped_column(Integer)
+
+    # ✅ FIX: Gmail internalDate is epoch milliseconds and overflows 32-bit Integer.
+    internal_date_ms: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+
     from_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     subject: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -68,6 +87,7 @@ class EmailIndex(Base):
 
     __table_args__ = (UniqueConstraint("google_account_id", "gmail_message_id", name="uq_gmail_msg"),)
 
+
 class Vendor(Base):
     __tablename__ = "vendors"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -76,6 +96,7 @@ class Vendor(Base):
     domains: Mapped[list | None] = mapped_column(JSON, nullable=True)
     support_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
 
 class Transaction(Base):
     __tablename__ = "transactions"
@@ -107,6 +128,7 @@ class Transaction(Base):
 
     __table_args__ = (UniqueConstraint("google_account_id", "gmail_message_id", name="uq_tx_gmail_msg"),)
 
+
 class Subscription(Base):
     __tablename__ = "subscriptions"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -115,7 +137,7 @@ class Subscription(Base):
     vendor_id: Mapped[int | None] = mapped_column(ForeignKey("vendors.id"), nullable=True)
     vendor_name: Mapped[str] = mapped_column(String(256), index=True)
 
-    amount: Mapped[float | None] = mapped_column(Numeric(12,2), nullable=True)
+    amount: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
     currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
     billing_cycle_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
@@ -129,6 +151,7 @@ class Subscription(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="subscriptions")
+
 
 class Notification(Base):
     __tablename__ = "notifications"
@@ -147,6 +170,7 @@ class Notification(Base):
 
     user = relationship("User", back_populates="notifications")
 
+
 class AIRun(Base):
     __tablename__ = "ai_runs"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -157,6 +181,7 @@ class AIRun(Base):
     success: Mapped[bool] = mapped_column(Boolean, default=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
 
 class AuditLog(Base):
     __tablename__ = "audit_log"
