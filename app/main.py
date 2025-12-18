@@ -9,6 +9,7 @@ from app.routers import (
     privacy,
     analytics,
     notifications,
+    debug,  # ✅ add
 )
 
 # --- DATABASE ---
@@ -48,6 +49,9 @@ app.include_router(refunds.router)
 
 # --- Trust & Privacy ---
 app.include_router(privacy.router)
+
+# --- Debug ---
+app.include_router(debug.router)  # ✅ add
 
 
 @app.get("/health", tags=["system"])
