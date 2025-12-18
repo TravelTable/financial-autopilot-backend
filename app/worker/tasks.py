@@ -1,9 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import logging
-import sys
-import os
-from datetime import datetime, timedelta, timezone, date
+from celery.utils.log import get_task_logger
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func
 
@@ -19,46 +18,26 @@ from app.subscriptions import recompute_subscriptions
 from app.alerts import schedule_alerts
 
 
-def _configure_logging() -> None:
-    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-
-    logging.basicConfig(
-        level=level,
-        stream=sys.stdout,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-        force=True,
-    )
-
-
-_configure_logging()
-logger = logging.getLogger("celery.tasks")
+logger = get_task_logger(__name__)
+pylogger = logging.getLogger(__name__)
 
 
 def _db() -> Session:
     return SessionLocal()
 
 
-def _to_date(v) -> date | None:
-    if v is None:
-        return None
-    if isinstance(v, date) and not isinstance(v, datetime):
-        return v
-    if isinstance(v, datetime):
-        return v.date()
-    if isinstance(v, str):
-        # allow "YYYY-MM-DD" and ISO datetime strings
-        try:
-            return datetime.fromisoformat(v).date()
-        except Exception:
-            return None
-    return None
+def _count(db: Session, model, **filters) -> int:
+    q = db.query(func.count()).select_from(model)
+    for k, v in filters.items():
+        q = q.filter(getattr(model, k) == v)
+    return int(q.scalar() or 0)
 
 
 @celery_app.task(name="app.worker.tasks.sync_user", bind=True)
 def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | None = None) -> dict:
-    # NOTE: anything logged here appears in the *worker* service logs in Railway
-    logger.info("sync_user start user_id=%s google_account_id=%s lookback_days=%s", user_id, google_account_id, lookback_days)
+    task_id = getattr(self.request, "id", None)
+    logger.info("sync_user start task_id=%s user_id=%s google_account_id=%s lookback_days=%s",
+                task_id, user_id, google_account_id, lookback_days)
 
     db = _db()
     try:
@@ -70,17 +49,16 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
             )
             .first()
         )
-
         if not acct:
-            logger.warning("sync_user account not found user_id=%s google_account_id=%s", user_id, google_account_id)
+            logger.error("sync_user account not found user_id=%s google_account_id=%s", user_id, google_account_id)
             return {"ok": False, "error": "account not found"}
 
         refresh = token_cipher.decrypt(acct.refresh_token_enc)
 
         days = int(lookback_days or settings.SYNC_LOOKBACK_DAYS)
         since_date = (datetime.now(timezone.utc) - timedelta(days=days)).date()
-        q = f"{settings.GMAIL_QUERY} after:{since_date.strftime('%Y/%m/%d')}"
 
+        q = f"{settings.GMAIL_QUERY} after:{since_date.strftime('%Y/%m/%d')}"
         logger.info("sync_user gmail query=%s", q)
 
         svc = build_gmail_service(
@@ -90,17 +68,32 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
             settings.GOOGLE_CLIENT_SECRET,
         )
 
-        indexed = 0
-        scanned = 0
+        indexed_new = 0
+        skipped_existing = 0
+        page = 0
         page_token = None
 
-        # 1) Index Gmail messages into EmailIndex table
+        # -------- Index messages --------
         while True:
-            resp = list_messages(svc, q, page_token=page_token, max_results=100)
+            page += 1
+            try:
+                resp = list_messages(svc, q, page_token=page_token, max_results=100)
+            except Exception as e:
+                logger.exception("sync_user Gmail list_messages failed page=%s: %s", page, str(e))
+                db.add(AuditLog(
+                    user_id=user_id,
+                    action="gmail_list_messages_error",
+                    meta={"page": page, "error": str(e)},
+                ))
+                db.commit()
+                raise
+
             msgs = resp.get("messages", []) or []
             page_token = resp.get("nextPageToken")
+            logger.info("sync_user page=%s fetched=%s has_next=%s", page, len(msgs), bool(page_token))
 
-            scanned += len(msgs)
+            if not msgs and not page_token:
+                break
 
             for m in msgs:
                 mid = m.get("id")
@@ -116,34 +109,51 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                     .first()
                 )
                 if exists:
+                    skipped_existing += 1
                     continue
 
-                full = get_message(svc, mid, format="full")
+                try:
+                    full = get_message(svc, mid, format="full")
+                except Exception as e:
+                    logger.exception("sync_user Gmail get_message failed mid=%s: %s", mid, str(e))
+                    db.add(AuditLog(
+                        user_id=user_id,
+                        action="gmail_get_message_error",
+                        meta={"gmail_message_id": mid, "error": str(e)},
+                    ))
+                    db.commit()
+                    continue
+
                 headers = extract_headers(full)
+
+                internal_date_raw = full.get("internalDate", "0")
+                try:
+                    internal_date_ms = int(internal_date_raw or "0")
+                except Exception:
+                    internal_date_ms = 0
 
                 db.add(
                     EmailIndex(
                         google_account_id=acct.id,
                         gmail_message_id=mid,
                         gmail_thread_id=full.get("threadId"),
-                        internal_date_ms=int(full.get("internalDate", "0")),
+                        internal_date_ms=internal_date_ms,
                         from_email=headers.get("from"),
                         subject=headers.get("subject"),
                         processed=False,
                     )
                 )
-                indexed += 1
+                indexed_new += 1
 
             db.commit()
 
             if not page_token:
                 break
 
-        logger.info("sync_user index complete scanned=%s indexed_new=%s", scanned, indexed)
+        logger.info("sync_user indexing complete indexed_new=%s skipped_existing=%s", indexed_new, skipped_existing)
 
-        # 2) Process pending EmailIndex rows into Transaction rows
+        # -------- Process pending --------
         llm = get_llm()
-
         pending = (
             db.execute(
                 select(EmailIndex).where(
@@ -154,13 +164,24 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
             .scalars()
             .all()
         )
-
         logger.info("sync_user pending emails=%s", len(pending))
 
         processed = 0
         tx_created = 0
 
-        for idx in pending:
+        def to_date(v):
+            if v is None:
+                return None
+            if hasattr(v, "isoformat"):
+                return v
+            if isinstance(v, str):
+                try:
+                    return datetime.fromisoformat(v).date()
+                except Exception:
+                    return None
+            return None
+
+        for i, idx in enumerate(pending, start=1):
             try:
                 full = get_message(svc, idx.gmail_message_id, format="full")
                 extracted = rules_extract(full)
@@ -169,10 +190,8 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                 text = get_plain_text_parts(payload)
                 headers = extract_headers(full)
 
-                # If we have text, try LLM enrichment (best effort)
                 if text:
                     import asyncio
-
                     ai = asyncio.run(
                         llm.extract_transaction(
                             email_subject=headers.get("subject", "") or "",
@@ -197,73 +216,53 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                             if ai.get(k) not in (None, "", {}):
                                 extracted[k] = ai[k]
 
-                # Avoid inserting duplicates if you re-run sync and EmailIndex is weird
-                already_tx = (
-                    db.query(Transaction.id)
-                    .filter(
-                        Transaction.user_id == user_id,
-                        Transaction.google_account_id == acct.id,
-                        Transaction.gmail_message_id == idx.gmail_message_id,
+                db.add(
+                    Transaction(
+                        user_id=user_id,
+                        google_account_id=acct.id,
+                        gmail_message_id=idx.gmail_message_id,
+                        vendor=extracted.get("vendor"),
+                        amount=extracted.get("amount"),
+                        currency=extracted.get("currency"),
+                        transaction_date=to_date(extracted.get("transaction_date")),
+                        category=extracted.get("category"),
+                        is_subscription=bool(extracted.get("is_subscription", False)),
+                        trial_end_date=to_date(extracted.get("trial_end_date")),
+                        renewal_date=to_date(extracted.get("renewal_date")),
+                        confidence=extracted.get("confidence"),
                     )
-                    .first()
                 )
-
-                if not already_tx:
-                    db.add(
-                        Transaction(
-                            user_id=user_id,
-                            google_account_id=acct.id,
-                            gmail_message_id=idx.gmail_message_id,
-                            vendor=extracted.get("vendor"),
-                            amount=extracted.get("amount"),
-                            currency=extracted.get("currency"),
-                            transaction_date=_to_date(extracted.get("transaction_date")),
-                            category=extracted.get("category"),
-                            is_subscription=bool(extracted.get("is_subscription", False)),
-                            trial_end_date=_to_date(extracted.get("trial_end_date")),
-                            renewal_date=_to_date(extracted.get("renewal_date")),
-                            confidence=extracted.get("confidence"),
-                        )
-                    )
-                    tx_created += 1
 
                 idx.processed = True
                 idx.processed_at = datetime.now(timezone.utc)
                 processed += 1
+                tx_created += 1
                 db.commit()
 
+                if i % 25 == 0:
+                    logger.info("sync_user processing progress processed=%s/%s tx_created=%s",
+                                i, len(pending), tx_created)
+
             except Exception as e:
-                logger.exception("sync_user email_process_error gmail_message_id=%s", idx.gmail_message_id)
+                logger.exception("sync_user email_process_error mid=%s: %s", idx.gmail_message_id, str(e))
                 db.add(
                     AuditLog(
                         user_id=user_id,
                         action="email_process_error",
-                        meta={
-                            "gmail_message_id": idx.gmail_message_id,
-                            "error": str(e),
-                        },
+                        meta={"gmail_message_id": idx.gmail_message_id, "error": str(e)},
                     )
                 )
                 db.commit()
 
         logger.info("sync_user processing complete processed=%s tx_created=%s", processed, tx_created)
 
-        # 3) Recompute subscriptions
-        try:
-            recompute_subscriptions(db, user_id=user_id)
-            db.commit()
-            logger.info("sync_user recompute_subscriptions ok")
-        except Exception:
-            logger.exception("sync_user recompute_subscriptions failed")
-            db.rollback()
-
-        # 4) Log counts (this tells us instantly if the backend is producing data)
-        tx_count = db.query(func.count(Transaction.id)).filter(Transaction.user_id == user_id).scalar() or 0
-        sub_count = db.query(func.count(Subscription.id)).filter(Subscription.user_id == user_id).scalar() or 0
-
-        logger.info("sync_user counts user_id=%s transactions=%s subscriptions=%s", user_id, tx_count, sub_count)
+        # -------- Recompute subscriptions --------
+        recompute_subscriptions(db, user_id=user_id)
 
         acct.last_sync_at = datetime.now(timezone.utc)
+
+        tx_total = db.query(func.count()).select_from(Transaction).filter(Transaction.user_id == user_id).scalar() or 0
+        sub_total = db.query(func.count()).select_from(Subscription).filter(Subscription.user_id == user_id).scalar() or 0
 
         db.add(
             AuditLog(
@@ -271,29 +270,41 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                 action="sync_complete",
                 meta={
                     "google_account_id": acct.id,
-                    "scanned": scanned,
-                    "indexed": indexed,
-                    "pending": len(pending),
+                    "indexed_new": indexed_new,
+                    "skipped_existing": skipped_existing,
                     "processed": processed,
                     "tx_created": tx_created,
-                    "tx_count": tx_count,
-                    "sub_count": sub_count,
+                    "tx_total": int(tx_total),
+                    "sub_total": int(sub_total),
                 },
             )
         )
         db.commit()
 
+        logger.info("sync_user done user_id=%s tx_total=%s sub_total=%s", user_id, int(tx_total), int(sub_total))
         return {
             "ok": True,
-            "scanned": scanned,
-            "indexed": indexed,
-            "pending": len(pending),
+            "indexed_new": indexed_new,
+            "skipped_existing": skipped_existing,
             "processed": processed,
             "tx_created": tx_created,
-            "tx_count": tx_count,
-            "sub_count": sub_count,
+            "tx_total": int(tx_total),
+            "sub_total": int(sub_total),
         }
 
+    except Exception as e:
+        # ensure we log a top-level failure too
+        logger.exception("sync_user FAILED task_id=%s user_id=%s: %s", task_id, user_id, str(e))
+        try:
+            db.add(AuditLog(
+                user_id=user_id,
+                action="sync_failed",
+                meta={"task_id": task_id, "error": str(e)},
+            ))
+            db.commit()
+        except Exception:
+            pass
+        raise
     finally:
         db.close()
 
@@ -311,7 +322,6 @@ def run_alert_scheduler() -> dict:
             )
         )
         db.commit()
-        logger.info("run_alert_scheduler scheduled=%s", n)
         return {"ok": True, "scheduled": n}
     finally:
         db.close()
