@@ -2,10 +2,21 @@ import enum
 from datetime import datetime, date
 
 from sqlalchemy import (
-    String, DateTime, Boolean, Integer, BigInteger, ForeignKey,
-    Numeric, Text, UniqueConstraint, Enum, Date, JSON
+    String,
+    DateTime,
+    Boolean,
+    Integer,
+    BigInteger,  # ✅ add
+    ForeignKey,
+    Numeric,
+    Text,
+    UniqueConstraint,
+    Enum,
+    Date,
+    JSON,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+
 from app.db import Base
 
 
@@ -65,7 +76,7 @@ class EmailIndex(Base):
     gmail_message_id: Mapped[str] = mapped_column(String(128), index=True)
     gmail_thread_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
-    # ✅ FIX: Gmail internalDate is epoch milliseconds (~1.7e12) => BIGINT required
+    # ✅ FIX: Gmail internalDate is ms since epoch, needs BIGINT
     internal_date_ms: Mapped[int] = mapped_column(BigInteger)
 
     from_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
