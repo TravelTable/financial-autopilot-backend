@@ -1,10 +1,7 @@
-from fastapi import FastAPI
 import logging
 import os
-import sys
 
-from sqlalchemy import text
-from sqlalchemy.exc import ProgrammingError
+from fastapi import FastAPI
 
 from app.routers import (
     auth,
@@ -20,22 +17,14 @@ from app.routers import (
 
 from app.db import engine
 from app.models import Base
-import app.models  # ensure model registration
+import app.models  # register models
 
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
-def configure_logging() -> None:
-    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
-    level = getattr(logging, level_name, logging.INFO)
-
-    logging.basicConfig(
-        level=level,
-        stream=sys.stdout,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-        force=True,
-    )
-
-
-configure_logging()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
 logger = logging.getLogger("app.main")
 
 app = FastAPI(
@@ -43,49 +32,32 @@ app = FastAPI(
     version="0.2.0",
 )
 
-
-def _ensure_bigint_internal_date_ms() -> None:
-    """
-    Gmail internalDate is epoch milliseconds (e.g. 1766020775000),
-    which overflows 32-bit INTEGER. Ensure BIGINT in Postgres.
-    """
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("""
-                ALTER TABLE emails_index
-                ALTER COLUMN internal_date_ms TYPE BIGINT
-                USING internal_date_ms::bigint
-            """))
-        logger.info("startup: ensured emails_index.internal_date_ms is BIGINT")
-    except ProgrammingError as e:
-        logger.warning("startup: could not alter emails_index.internal_date_ms (%s)", str(e))
-    except Exception as e:
-        logger.exception("startup: failed ensuring BIGINT for internal_date_ms: %s", str(e))
-
-
 @app.on_event("startup")
 def on_startup():
     logger.info("startup: creating tables if needed")
     Base.metadata.create_all(bind=engine)
     logger.info("startup: tables ensured")
-    _ensure_bigint_internal_date_ms()
 
-
-# Routers
+# --- Core ---
 app.include_router(auth.router)
 app.include_router(sync.router)
 
+# --- Data ---
 app.include_router(transactions.router)
 app.include_router(subscriptions.router)
 
+# --- Intelligence ---
 app.include_router(analytics.router)
 app.include_router(notifications.router)
 
+# --- Automation ---
 app.include_router(refunds.router)
+
+# --- Trust & Privacy ---
 app.include_router(privacy.router)
 
+# --- Debug ---
 app.include_router(debug.router)
-
 
 @app.get("/health", tags=["system"])
 def health():
