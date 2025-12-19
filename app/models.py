@@ -1,8 +1,9 @@
 import enum
 from datetime import datetime, date
+
 from sqlalchemy import (
-    String, DateTime, Boolean, Integer, BigInteger, ForeignKey, Numeric, Text,
-    UniqueConstraint, Enum, Date, JSON
+    String, DateTime, Boolean, Integer, BigInteger, ForeignKey,
+    Numeric, Text, UniqueConstraint, Enum, Date, JSON
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db import Base
@@ -64,8 +65,8 @@ class EmailIndex(Base):
     gmail_message_id: Mapped[str] = mapped_column(String(128), index=True)
     gmail_thread_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
-    # ✅ FIX: Gmail internalDate is epoch milliseconds (e.g. 1766020775000) -> needs BIGINT
-    internal_date_ms: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    # ✅ FIX: Gmail internalDate is epoch milliseconds (~1.7e12) => BIGINT required
+    internal_date_ms: Mapped[int] = mapped_column(BigInteger)
 
     from_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     subject: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -127,7 +128,7 @@ class Subscription(Base):
     vendor_id: Mapped[int | None] = mapped_column(ForeignKey("vendors.id"), nullable=True)
     vendor_name: Mapped[str] = mapped_column(String(256), index=True)
 
-    amount: Mapped[float | None] = mapped_column(Numeric(12,2), nullable=True)
+    amount: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
     currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
     billing_cycle_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
