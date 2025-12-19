@@ -1,7 +1,7 @@
-import logging
 import os
-
-from fastapi import FastAPI
+import logging
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from app.routers import (
     auth,
@@ -12,19 +12,23 @@ from app.routers import (
     privacy,
     analytics,
     notifications,
-    debug,
+    debug,  # ✅ debug router
 )
 
+# --- DATABASE ---
 from app.db import engine
 from app.models import Base
-import app.models  # register models
+import app.models  # noqa: F401  # ensures models are registered
 
+# ---------------- Logging ----------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    force=True,  # important on Railway/uvicorn
 )
+
 logger = logging.getLogger("app.main")
 
 app = FastAPI(
@@ -32,11 +36,25 @@ app = FastAPI(
     version="0.2.0",
 )
 
+# Simple request logger (helps confirm which service is serving what)
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    try:
+        response = await call_next(request)
+        logger.info("%s %s -> %s", request.method, request.url.path, getattr(response, "status_code", "?"))
+        return response
+    except Exception as e:
+        logger.exception("Unhandled error on %s %s: %s", request.method, request.url.path, str(e))
+        return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
+
+# --- CREATE TABLES ON STARTUP ---
 @app.on_event("startup")
 def on_startup():
     logger.info("startup: creating tables if needed")
     Base.metadata.create_all(bind=engine)
     logger.info("startup: tables ensured")
+
 
 # --- Core ---
 app.include_router(auth.router)
@@ -58,6 +76,7 @@ app.include_router(privacy.router)
 
 # --- Debug ---
 app.include_router(debug.router)
+
 
 @app.get("/health", tags=["system"])
 def health():
