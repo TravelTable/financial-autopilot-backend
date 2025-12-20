@@ -9,7 +9,6 @@ from sqlalchemy.orm import Session
 
 from app.models import Transaction, Subscription, SubscriptionStatus
 
-
 # -----------------------------
 # Vendor + amount normalization
 # -----------------------------
@@ -18,6 +17,8 @@ _NOISE_TOKENS = {
     "payment", "payments", "purchase", "purchases", "receipt", "invoice", "order",
     "confirm", "confirmation", "subscription", "subs", "billing", "bill", "charges",
 }
+
+_SEPARATORS = ["•", "·", "|", "/", "\\", ",", ";", "—", "-", "_", ":", "(", ")", "[", "]", "{", "}", "*"]
 
 
 def _normalize_vendor(v: str) -> str:
@@ -30,13 +31,13 @@ def _normalize_vendor(v: str) -> str:
         return ""
 
     # Common separators / cruft
-    for ch in ["•", "·", "|", "/", "\", ",", ";", "—", "-", "_", ":", "(", ")", "[", "]", "{", "}", "*"]:
+    for ch in _SEPARATORS:
         s = s.replace(ch, " ")
 
-    # Collapse whitespace
+    # Collapse whitespace + remove generic noise tokens
     parts = [p for p in s.split() if p and p not in _NOISE_TOKENS]
 
-    # Drop trailing digits/tokens like "1234" (often card suffix)
+    # Drop trailing digits (often card suffix)
     while parts and parts[-1].isdigit():
         parts.pop()
 
@@ -58,10 +59,18 @@ def _median(nums: list[float]) -> float | None:
     if not nums:
         return None
     s = sorted(nums)
-    return s[len(s) // 2]
+    mid = len(s) // 2
+    if len(s) % 2 == 1:
+        return s[mid]
+    return (s[mid - 1] + s[mid]) / 2.0
 
 
-def _cluster_by_amount(items: list[Transaction], *, abs_tol: float = 1.0, pct_tol: float = 0.05) -> list[list[Transaction]]:
+def _cluster_by_amount(
+    items: list[Transaction],
+    *,
+    abs_tol: float = 1.0,
+    pct_tol: float = 0.05
+) -> list[list[Transaction]]:
     """
     Split a vendor group into multiple clusters so we can detect multiple subs
     under the same vendor (e.g., different tiers/add-ons).
@@ -88,7 +97,7 @@ def _cluster_by_amount(items: list[Transaction], *, abs_tol: float = 1.0, pct_to
         tol = max(abs_tol, abs(cur_center) * pct_tol)
         if abs(a - cur_center) <= tol:
             cur.append(t)
-            # update center (running median-ish using mean)
+            # update center (running mean)
             cur_center = (cur_center * (len(cur) - 1) + a) / len(cur)
         else:
             clusters.append(cur)
@@ -146,7 +155,7 @@ def _gap_variability_days(dates, median_gap: int) -> int | None:
     return sorted(dev)[len(dev) // 2]
 
 
-def _roll_forward(date_val, gap_days: int, *, today) :
+def _roll_forward(date_val, gap_days: int, *, today):
     """
     If last+gap is in the past (missed cycles), roll forward a few cycles.
     """
@@ -289,7 +298,12 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
                 continue
 
             # Flagged evidence from extraction/LLM
-            flagged = [t for t in cluster_items if getattr(t, "is_subscription", False) or getattr(t, "trial_end_date", None) or getattr(t, "renewal_date", None)]
+            flagged = [
+                t for t in cluster_items
+                if getattr(t, "is_subscription", False)
+                or getattr(t, "trial_end_date", None)
+                or getattr(t, "renewal_date", None)
+            ]
 
             # Cadence inference (if possible)
             median_gap = _median_gap_days(dates)
@@ -300,6 +314,7 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
             variability = _gap_variability_days(dates, median_gap) if median_gap else None
 
             last_date = max(dates)
+
             # Choose next renewal:
             # 1) explicit renewal_date (prefer latest in the future)
             explicit_renewals = sorted(
@@ -308,12 +323,18 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
             )
             next_renewal = next((d for d in explicit_renewals if d >= now), None)
 
-            # 2) if trial_end_date exists and no paid charges, treat as next renewal candidate
-            trial_dates = sorted({t.trial_end_date for t in flagged if getattr(t, "trial_end_date", None)}, reverse=True)
+            # 2) trial_end_date (prefer latest in the future)
+            trial_dates = sorted(
+                {t.trial_end_date for t in flagged if getattr(t, "trial_end_date", None)},
+                reverse=True,
+            )
             trial_end = next((d for d in trial_dates if d >= now), None)
 
-            # 3) fallback to cadence prediction
+            predicted_is_estimated = False
+
+            # 3) cadence prediction
             if next_renewal is None and median_gap is not None:
+                predicted_is_estimated = True
                 next_renewal = _roll_forward(last_date + timedelta(days=median_gap), median_gap, today=now)
 
             if next_renewal is None:
@@ -322,11 +343,11 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
                     continue
 
             # Status logic:
-            # - trial if trial_end is present and either no cadence or only 1/2 charges
+            # if your enum doesn’t have trial/canceled, fall back to active but keep meta.kind.
             status_trial = getattr(SubscriptionStatus, "trial", None)
             status_canceled = getattr(SubscriptionStatus, "canceled", None)
 
-            if trial_end is not None and (len(dates) <= 1 or (amount_median is not None and abs(amount_median) < 0.01)):
+            if trial_end is not None and len(dates) <= 1:
                 status = status_trial or SubscriptionStatus.active
                 kind = "trial"
             else:
@@ -357,29 +378,53 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
             display_vendor = _pick_display_vendor(cluster_items) or vendor_key
 
             # Evidence transaction ids (best effort)
-            evidence_ids = [getattr(t, "id", None) for t in sorted(cluster_items, key=lambda x: getattr(x, "transaction_date", now), reverse=True)[:8]]
+            evidence_ids = [
+                getattr(t, "id", None)
+                for t in sorted(
+                    cluster_items,
+                    key=lambda x: getattr(x, "transaction_date", now),
+                    reverse=True
+                )[:8]
+            ]
             evidence_ids = [i for i in evidence_ids if i is not None]
 
+            # Currency: first non-null currency we see in this cluster
+            currency = next((getattr(t, "currency", None) for t in cluster_items if getattr(t, "currency", None)), None)
+
+            # Store meta keys aligned to your insights endpoint/schema
             db.add(
                 Subscription(
                     user_id=user_id,
                     vendor_name=display_vendor,
                     amount=amount_median,
-                    currency=next((getattr(t, "currency", None) for t in cluster_items if getattr(t, "currency", None)), None),
+                    currency=currency,
                     billing_cycle_days=median_gap,
                     last_charge_date=last_date,
                     next_renewal_date=next_renewal or trial_end,
                     trial_end_date=trial_end,
                     status=status,
                     meta={
+                        # provenance
                         "source": "recompute_v2",
                         "kind": kind,
                         "vendor_key": vendor_key,
+
+                        # counts
                         "count": len(cluster_items),
                         "flagged_count": len(flagged),
+
+                        # cadence (old + new keys)
                         "median_gap_days": median_gap,
                         "gap_variability_days": variability,
-                        "confidence": confidence,
+                        "cadence_days": median_gap,
+                        "cadence_variance_days": variability,
+
+                        # prediction
+                        "predicted_next_renewal_date": next_renewal if predicted_is_estimated else None,
+                        "predicted_is_estimated": bool(predicted_is_estimated),
+
+                        # explainability
+                        "confidence": float(confidence),
                         "reasons": reasons[:8],
                         "evidence_tx_ids": evidence_ids,
                     },
@@ -390,4 +435,7 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
     db.commit()
 
     after = db.query(Subscription).filter(Subscription.user_id == user_id).count()
-    print(f"[recompute_subscriptions] deleted {before - len(ignored)} old, preserved {len(ignored)} ignored, created {created}, now {after} subscriptions for user {user_id}")
+    print(
+        f"[recompute_subscriptions] deleted {before - len(ignored)} old, preserved {len(ignored)} ignored, "
+        f"created {created}, now {after} subscriptions for user {user_id}"
+    )
