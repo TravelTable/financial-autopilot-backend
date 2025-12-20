@@ -1,4 +1,6 @@
-from datetime import date, datetime
+from __future__ import annotations
+
+import datetime as dt
 from pydantic import BaseModel, Field
 
 
@@ -17,7 +19,7 @@ class SyncRequest(BaseModel):
 
 
 class SyncStatusOut(BaseModel):
-    last_sync_at: datetime | None
+    last_sync_at: dt.datetime | None
     last_history_id: str | None
     queued: bool = False
 
@@ -28,11 +30,11 @@ class TransactionOut(BaseModel):
     vendor: str | None
     amount: float | None
     currency: str | None
-    transaction_date: date | None
+    transaction_date: dt.date | None
     category: str | None
     is_subscription: bool
-    trial_end_date: date | None
-    renewal_date: date | None
+    trial_end_date: dt.date | None
+    renewal_date: dt.date | None
 
 
 class SubscriptionOut(BaseModel):
@@ -41,17 +43,15 @@ class SubscriptionOut(BaseModel):
     amount: float | None
     currency: str | None
     billing_cycle_days: int | None
-    last_charge_date: date | None
-    next_renewal_date: date | None
-    trial_end_date: date | None
+    last_charge_date: dt.date | None
+    next_renewal_date: dt.date | None
+    trial_end_date: dt.date | None
     status: str
 
 
 class RefundDraftIn(BaseModel):
     transaction_id: int
-    reason: str = Field(
-        default="I did not intend to purchase this and would like a refund."
-    )
+    reason: str = Field(default="I did not intend to purchase this and would like a refund.")
     tone: str = Field(default="polite_firm")
 
 
@@ -72,7 +72,7 @@ class DeleteAccountOut(BaseModel):
 
 class EvidenceChargeOut(BaseModel):
     id: int
-    date: datetime.date | None = None
+    date: dt.date | None = None
     amount: float | None = None
     currency: str | None = None
 
@@ -87,9 +87,9 @@ class SubscriptionInsightsOut(BaseModel):
     currency: str | None = None
 
     billing_cycle_days: int | None = None
-    last_charge_date: date | None = None
-    next_renewal_date: date | None = None
-    trial_end_date: date | None = None
+    last_charge_date: dt.date | None = None
+    next_renewal_date: dt.date | None = None
+    trial_end_date: dt.date | None = None
 
     # Explainable AI insights
     confidence: float
@@ -98,8 +98,8 @@ class SubscriptionInsightsOut(BaseModel):
     # Cadence + prediction
     cadence_days: int | None = None
     cadence_variance_days: float | None = None
-    predicted_next_renewal_date: date | None = None
+    predicted_next_renewal_date: dt.date | None = None
     predicted_is_estimated: bool = False
 
     # Proof (last charges)
-    evidence_charges: list[EvidenceChargeOut] = []
+    evidence_charges: list[EvidenceChargeOut] = Field(default_factory=list)
