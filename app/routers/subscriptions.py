@@ -86,36 +86,7 @@ def _get_meta(s: Subscription) -> dict:
 # Response models for insights
 # -----------------------------
 
-class EvidenceChargeOut(BaseModel):
-    id: int
-    date: Optional[date] = None
-    amount: Optional[float] = None
-    currency: Optional[str] = None
 
-
-class SubscriptionInsightsOut(BaseModel):
-    id: int
-    vendor_name: str
-    status: str
-
-    amount: Optional[float] = None
-    currency: Optional[str] = None
-
-    billing_cycle_days: Optional[int] = None
-    last_charge_date: Optional[date] = None
-    next_renewal_date: Optional[date] = None
-    trial_end_date: Optional[date] = None
-
-    # Pop-up “AI style” insights (but backed by real evidence)
-    confidence: float
-    reasons: list[str]
-
-    cadence_days: Optional[int] = None
-    cadence_variance_days: Optional[float] = None
-    predicted_next_renewal_date: Optional[date] = None
-    predicted_is_estimated: bool = False
-
-    evidence_charges: list[EvidenceChargeOut] = []
 
 
 # -----------------------------
