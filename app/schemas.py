@@ -53,3 +53,43 @@ class RefundDraftOut(BaseModel):
 
 class DeleteAccountOut(BaseModel):
     deleted: bool = True
+
+
+# ================================
+# Subscription insights (pop-up)
+# ================================
+
+class EvidenceChargeOut(BaseModel):
+    id: int
+    date: date | None = None
+    amount: float | None = None
+    currency: str | None = None
+
+
+class SubscriptionInsightsOut(BaseModel):
+    # Core subscription fields
+    id: int
+    vendor_name: str
+    status: str
+
+    amount: float | None = None
+    currency: str | None = None
+
+    billing_cycle_days: int | None = None
+    last_charge_date: date | None = None
+    next_renewal_date: date | None = None
+    trial_end_date: date | None = None
+
+    # Explainable AI insights
+    confidence: float
+    reasons: list[str]
+
+    # Cadence + prediction
+    cadence_days: int | None = None
+    cadence_variance_days: float | None = None
+    predicted_next_renewal_date: date | None = None
+    predicted_is_estimated: bool = False
+
+    # Proof (last charges)
+    evidence_charges: list[EvidenceChargeOut] = []
+
