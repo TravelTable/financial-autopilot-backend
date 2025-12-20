@@ -19,7 +19,8 @@ try:
 except Exception:  # pragma: no cover
     Transaction = None  # type: ignore
 
-from app.schemas import SubscriptionOut
+from app.schemas import SubscriptionOut, SubscriptionInsightsOut, EvidenceChargeOut
+
 
 router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
 
