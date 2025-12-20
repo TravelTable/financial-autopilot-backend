@@ -4,13 +4,13 @@ from datetime import date
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.deps import get_current_user_id
 from app.db import get_db
 from app.models import Subscription, SubscriptionStatus
+from app.schemas import SubscriptionOut, SubscriptionInsightsOut, EvidenceChargeOut
 
 # Transaction model might exist in app.models
 # We import it optionally to avoid hard crashes if name differs.
@@ -18,8 +18,6 @@ try:
     from app.models import Transaction  # type: ignore
 except Exception:  # pragma: no cover
     Transaction = None  # type: ignore
-
-from app.schemas import SubscriptionOut, SubscriptionInsightsOut, EvidenceChargeOut
 
 
 router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
@@ -82,11 +80,54 @@ def _get_meta(s: Subscription) -> dict:
     return {}
 
 
-# -----------------------------
-# Response models for insights
-# -----------------------------
+def _parse_date_maybe(v: Any) -> Optional[date]:
+    """
+    JSON meta may store dates as ISO strings. Accept:
+    - date
+    - "YYYY-MM-DD"
+    """
+    if v is None:
+        return None
+    if isinstance(v, date):
+        return v
+    if isinstance(v, str):
+        try:
+            return date.fromisoformat(v.strip()[:10])
+        except Exception:
+            return None
+    return None
 
 
+def _parse_int_maybe(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return int(v)
+    if isinstance(v, str):
+        try:
+            return int(float(v.strip()))
+        except Exception:
+            return None
+    return None
+
+
+def _parse_float_maybe(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        try:
+            return float(v.strip())
+        except Exception:
+            return None
+    return None
 
 
 # -----------------------------
@@ -151,7 +192,7 @@ def ignore_subscription(
 
 
 # -----------------------------
-# NEW: Insights endpoint for pop-up sheet
+# Insights endpoint for pop-up sheet
 # -----------------------------
 
 @router.get("/{subscription_id}/insights", response_model=SubscriptionInsightsOut)
@@ -176,26 +217,62 @@ def subscription_insights(
     if not isinstance(reasons, list):
         reasons = [str(reasons)]
 
-    cadence_days = meta.get("cadence_days") or meta.get("billing_cycle_days") or s.billing_cycle_days
+    cadence_days = (
+        meta.get("cadence_days")
+        or meta.get("billing_cycle_days")
+        or s.billing_cycle_days
+    )
     cadence_variance_days = meta.get("cadence_variance_days") or meta.get("cadence_variance") or None
 
     predicted_next = meta.get("predicted_next_renewal_date") or meta.get("predicted_next_renewal") or None
-    # predicted_next might be a string; keep it None unless it’s already a date object
-    if predicted_next is not None and not isinstance(predicted_next, date):
-        predicted_next = None
+    predicted_next = _parse_date_maybe(predicted_next)
 
     predicted_is_estimated = bool(meta.get("predicted_is_estimated", False))
 
-    # Evidence: last N charges for same vendor
+    # Evidence charges:
+    # Prefer exact transaction ids written by recompute_subscriptions into meta["evidence_tx_ids"].
     evidence: list[EvidenceChargeOut] = []
-    if Transaction is not None:
+    evidence_tx_ids = meta.get("evidence_tx_ids")
+
+    if Transaction is not None and isinstance(evidence_tx_ids, list) and evidence_tx_ids:
+        ids: list[int] = []
+        for raw in evidence_tx_ids:
+            val = _parse_int_maybe(raw)
+            if val is not None:
+                ids.append(val)
+
+        if ids:
+            txs = (
+                db.execute(
+                    select(Transaction)
+                    .where(
+                        Transaction.user_id == user_id,
+                        Transaction.id.in_(ids),
+                    )
+                    .order_by(Transaction.transaction_date.desc().nullslast())
+                )
+                .scalars()
+                .all()
+            )
+
+            for tx in txs[:6]:
+                evidence.append(
+                    EvidenceChargeOut(
+                        id=int(getattr(tx, "id")),
+                        date=getattr(tx, "transaction_date", None),
+                        amount=_safe_float(getattr(tx, "amount", None)),
+                        currency=getattr(tx, "currency", None),
+                    )
+                )
+
+    # Fallback for older subscriptions that don't have evidence ids yet:
+    if Transaction is not None and not evidence:
         target = _normalize_vendor(getattr(s, "vendor_name", "") or "")
-        # Pull recent user transactions then filter in Python for safety
         txs = db.execute(
             select(Transaction)
             .where(Transaction.user_id == user_id)
-            .order_by(getattr(Transaction, "transaction_date").desc())
-            .limit(200)
+            .order_by(Transaction.transaction_date.desc().nullslast())
+            .limit(250)
         ).scalars().all()
 
         matched = []
@@ -204,7 +281,6 @@ def subscription_insights(
             if v and target and v == target:
                 matched.append(tx)
 
-        # Most recent first, keep last 6 as evidence
         for tx in matched[:6]:
             evidence.append(
                 EvidenceChargeOut(
@@ -215,11 +291,11 @@ def subscription_insights(
                 )
             )
 
-        # Fallback: if we found no exact normalized match, try loose “contains”
         if not evidence and target:
             for tx in txs:
                 v_raw = (getattr(tx, "vendor", "") or "").strip().lower()
-                if v_raw and (target in _normalize_vendor(v_raw) or _normalize_vendor(v_raw) in target):
+                v_norm = _normalize_vendor(v_raw)
+                if v_norm and (target in v_norm or v_norm in target):
                     evidence.append(
                         EvidenceChargeOut(
                             id=int(getattr(tx, "id")),
@@ -255,8 +331,8 @@ def subscription_insights(
         trial_end_date=s.trial_end_date,
         confidence=confidence,
         reasons=[str(r) for r in reasons],
-        cadence_days=int(cadence_days) if isinstance(cadence_days, (int, float)) else None,
-        cadence_variance_days=float(cadence_variance_days) if isinstance(cadence_variance_days, (int, float)) else None,
+        cadence_days=_parse_int_maybe(cadence_days),
+        cadence_variance_days=_parse_float_maybe(cadence_variance_days),
         predicted_next_renewal_date=predicted_next,
         predicted_is_estimated=predicted_is_estimated,
         evidence_charges=evidence,
