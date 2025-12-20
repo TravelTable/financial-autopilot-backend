@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+import time
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -25,22 +27,93 @@ def _db() -> Session:
     return SessionLocal()
 
 
-def _to_date(v):
+def _to_date(v: Any) -> Optional[date]:
+    """
+    Convert various date-like inputs into a `date`:
+    - date -> date
+    - datetime -> datetime.date()
+    - "YYYY-MM-DD" -> date
+    - ISO datetime string -> date
+    - epoch seconds/ms -> date
+    """
     if v is None:
         return None
-    if hasattr(v, "isoformat"):
+
+    if isinstance(v, datetime):
+        return v.date()
+
+    if isinstance(v, date):
         return v
-    if isinstance(v, str):
+
+    if isinstance(v, (int, float)):
+        # treat as epoch seconds or milliseconds
         try:
-            return datetime.fromisoformat(v).date()
+            ts = float(v)
+            if ts > 1e12:  # ms
+                ts = ts / 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc).date()
+        except Exception:
+            return None
+
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+
+        # Try date-only first
+        try:
+            return date.fromisoformat(s[:10])
+        except Exception:
+            pass
+
+        # Then full ISO datetime
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
+        except Exception:
+            pass
+
+        # Try numeric string epoch
+        try:
+            ts = float(s)
+            if ts > 1e12:
+                ts = ts / 1000.0
+            return datetime.fromtimestamp(ts, tz=timezone.utc).date()
+        except Exception:
+            return None
+
+    return None
+
+
+def _to_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            return float(s)
         except Exception:
             return None
     return None
 
 
 _SUBJECT_HINTS = (
-    "receipt", "invoice", "subscription", "trial", "renewal", "payment", "charged",
-    "your order", "order confirmation", "thank you for", "billing",
+    "receipt",
+    "invoice",
+    "subscription",
+    "trial",
+    "renewal",
+    "payment",
+    "charged",
+    "your order",
+    "order confirmation",
+    "thank you for",
+    "billing",
 )
 
 
@@ -64,9 +137,11 @@ def _is_llm_candidate(*, headers: dict, snippet: str, text: str, extracted: dict
     if extracted.get("is_subscription") or extracted.get("trial_end_date") or extracted.get("renewal_date"):
         return True
 
-    # If rules got a number but missed core fields, LLM may help
-    missing_core = not extracted.get("vendor") or extracted.get("amount") in (None, "", 0) or not extracted.get("transaction_date")
-    if missing_core and len(text) > 200:
+    # If rules missed core fields, LLM may help (only if we have enough text)
+    missing_vendor = not extracted.get("vendor")
+    missing_amount = extracted.get("amount") in (None, "")
+    missing_date = not extracted.get("transaction_date")
+    if (missing_vendor or missing_amount or missing_date) and len(text) > 200:
         return True
 
     return False
@@ -75,18 +150,35 @@ def _is_llm_candidate(*, headers: dict, snippet: str, text: str, extracted: dict
 def _run_async(coro):
     """
     Run an async coroutine from a sync Celery worker safely.
-    Avoid creating a brand-new loop object over and over via asyncio.run().
+
+    Celery tasks are typically sync. We'll run async extraction when needed.
     """
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
+        # If we already have a running loop (rare in Celery), schedule thread-safe
+        fut = asyncio.run_coroutine_threadsafe(coro, loop)
+        return fut.result()
     except RuntimeError:
-        loop = None
+        # No running loop
+        return asyncio.run(coro)
 
-    if loop and loop.is_running():
-        # Celery normally won't have a running loop, but guard anyway.
-        return asyncio.run_coroutine_threadsafe(coro, loop).result()
 
-    return asyncio.run(coro)
+def _gmail_get_message_with_retry(svc, message_id: str, *, format: str = "full", tries: int = 3):
+    """
+    Gmail API can occasionally fail transiently. Simple backoff retry.
+    """
+    delay = 0.8
+    last_err = None
+    for attempt in range(1, tries + 1):
+        try:
+            return get_message(svc, message_id, format=format)
+        except Exception as e:
+            last_err = e
+            if attempt == tries:
+                break
+            time.sleep(delay)
+            delay *= 1.8
+    raise last_err  # type: ignore[misc]
 
 
 @celery_app.task(name="app.worker.tasks.sync_user", bind=True)
@@ -151,7 +243,7 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                     skipped_existing += 1
                     continue
 
-                full = get_message(svc, mid, format="full")
+                full = _gmail_get_message_with_retry(svc, mid, format="full")
                 headers = extract_headers(full)
 
                 internal_ms_raw = full.get("internalDate", "0")
@@ -199,11 +291,11 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
 
         processed = 0
         tx_created = 0
-        batch_commits = 0
+        batch_count = 0
 
         for idx in pending:
             try:
-                # If we already created a transaction for this email (crash-retry safety), skip.
+                # Crash-retry safety: if we already wrote a transaction for this email, mark processed and skip.
                 existing_tx = (
                     db.query(Transaction)
                     .filter(
@@ -219,13 +311,16 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                     processed += 1
                     continue
 
-                full = get_message(svc, idx.gmail_message_id, format="full")
+                full = _gmail_get_message_with_retry(svc, idx.gmail_message_id, format="full")
                 extracted = rules_extract(full)
 
                 payload = full.get("payload", {}) or {}
                 text = get_plain_text_parts(payload) or ""
                 headers = extract_headers(full)
                 snippet = full.get("snippet", "") or ""
+
+                llm_used = False
+                llm_error = None
 
                 # Optional LLM enrichment (gated)
                 if _is_llm_candidate(headers=headers, snippet=snippet, text=text, extracted=extracted):
@@ -238,7 +333,9 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                                 email_text=text,
                             )
                         )
+                        llm_used = True
                         if isinstance(ai, dict):
+                            # Only overwrite if AI provides a meaningful value
                             for k in [
                                 "vendor",
                                 "amount",
@@ -253,28 +350,46 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                                 if ai.get(k) not in (None, "", {}):
                                     extracted[k] = ai[k]
                     except Exception as e:
+                        llm_error = str(e)
                         db.add(
                             AuditLog(
                                 user_id=user_id,
                                 action="llm_extract_error",
-                                meta={"gmail_message_id": idx.gmail_message_id, "error": str(e)},
+                                meta={"gmail_message_id": idx.gmail_message_id, "error": llm_error},
                             )
                         )
+
+                # Normalize types before insert
+                vendor = extracted.get("vendor")
+                currency = extracted.get("currency")
+                amount = _to_float(extracted.get("amount"))
+                tx_date = _to_date(extracted.get("transaction_date"))
+                trial_end = _to_date(extracted.get("trial_end_date"))
+                renewal_date = _to_date(extracted.get("renewal_date"))
+
+                # Store confidence as JSON, and record provenance (rules vs llm)
+                conf_obj = extracted.get("confidence")
+                if conf_obj is None or not isinstance(conf_obj, dict):
+                    conf_obj = {}
+
+                conf_obj.setdefault("source", "llm+rules" if llm_used else "rules")
+                if llm_error:
+                    conf_obj["llm_error"] = llm_error
 
                 db.add(
                     Transaction(
                         user_id=user_id,
                         google_account_id=acct.id,
                         gmail_message_id=idx.gmail_message_id,
-                        vendor=extracted.get("vendor"),
-                        amount=extracted.get("amount"),
-                        currency=extracted.get("currency"),
-                        transaction_date=_to_date(extracted.get("transaction_date")),
+                        vendor=vendor,
+                        amount=amount,
+                        currency=currency,
+                        transaction_date=tx_date,
                         category=extracted.get("category"),
                         is_subscription=bool(extracted.get("is_subscription", False)),
-                        trial_end_date=_to_date(extracted.get("trial_end_date")),
-                        renewal_date=_to_date(extracted.get("renewal_date")),
-                        confidence=extracted.get("confidence"),
+                        trial_end_date=trial_end,
+                        renewal_date=renewal_date,
+                        confidence=conf_obj,
                     )
                 )
                 tx_created += 1
@@ -283,13 +398,14 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                 idx.processed_at = datetime.now(timezone.utc)
                 processed += 1
 
-                # Batch commits for speed
-                batch_commits += 1
-                if batch_commits >= 25:
+                batch_count += 1
+                if batch_count >= 25:
                     db.commit()
-                    batch_commits = 0
+                    batch_count = 0
 
             except Exception as e:
+                # Avoid infinite retry loops on one bad email:
+                # log and mark processed so the queue can move on.
                 db.add(
                     AuditLog(
                         user_id=user_id,
@@ -297,6 +413,11 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                         meta={"gmail_message_id": idx.gmail_message_id, "error": str(e)},
                     )
                 )
+                try:
+                    idx.processed = True
+                    idx.processed_at = datetime.now(timezone.utc)
+                except Exception:
+                    pass
                 db.commit()
 
         # Flush any remaining batch
@@ -304,7 +425,7 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
 
         logger.info("sync_user processing complete processed=%s tx_created=%s", processed, tx_created)
 
-        # ✅ Only recompute if we actually created new transactions
+        # Only recompute if we actually created new transactions
         if tx_created > 0:
             recompute_subscriptions(db, user_id=user_id)
         else:
