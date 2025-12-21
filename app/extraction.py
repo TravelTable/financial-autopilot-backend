@@ -63,7 +63,22 @@ def rules_extract(message: dict) -> dict[str, Any]:
         tx_date = datetime.fromtimestamp(internal_date_ms / 1000, tz=timezone.utc).date()
 
     blob = (subject + " " + snippet).lower()
-    is_sub = any(k in blob for k in ["subscription", "renewal", "trial", "free trial", "recurring", "membership"])
+    is_sub = any(
+        k in blob
+        for k in [
+            "subscription",
+            "renewal",
+            "trial",
+            "free trial",
+            "recurring",
+            "membership",
+            "subscribe",
+            "plan",
+            "auto-renew",
+            "active subscription",
+            "subscribed",
+        ]
+    )
 
     cat = None
     if any(k in blob for k in ["uber", "lyft", "taxi"]):

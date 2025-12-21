@@ -114,6 +114,11 @@ _SUBJECT_HINTS = (
     "order confirmation",
     "thank you for",
     "billing",
+    "membership",
+    "plan",
+    "auto-renew",
+    "subscribe",
+    "active subscription",
 )
 
 
@@ -203,10 +208,12 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
             return {"ok": False, "error": "account not found"}
 
         refresh = token_cipher.decrypt(acct.refresh_token_enc)
-        days = int(lookback_days or settings.SYNC_LOOKBACK_DAYS)
-        since_date = (datetime.now(timezone.utc) - timedelta(days=days)).date()
-
-        q = f"{settings.GMAIL_QUERY} after:{since_date.strftime('%Y/%m/%d')}"
+        if lookback_days is None:
+            q = settings.GMAIL_QUERY
+        else:
+            days = int(lookback_days or settings.SYNC_LOOKBACK_DAYS)
+            since_date = (datetime.now(timezone.utc) - timedelta(days=days)).date()
+            q = f"{settings.GMAIL_QUERY} after:{since_date.strftime('%Y/%m/%d')}"
         logger.info("sync_user gmail query=%s", q)
 
         svc = build_gmail_service(
