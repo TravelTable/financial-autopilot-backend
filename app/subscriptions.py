@@ -69,7 +69,7 @@ def _cluster_by_amount(
     items: list[Transaction],
     *,
     abs_tol: float = 1.0,
-    pct_tol: float = 0.05
+    pct_tol: float = 0.05,
 ) -> list[list[Transaction]]:
     """
     Split a vendor group into multiple clusters so we can detect multiple subs
@@ -155,6 +155,29 @@ def _gap_variability_days(dates, median_gap: int) -> int | None:
     return sorted(dev)[len(dev) // 2]
 
 
+def _gap_skipped_cycles(dates, median_gap: int) -> int:
+    if len(dates) < 2 or not median_gap:
+        return 0
+    gaps = [(dates[i] - dates[i - 1]).days for i in range(1, len(dates))]
+    gaps = [g for g in gaps if g > 0]
+    if not gaps:
+        return 0
+    threshold = int(median_gap * 1.5)
+    return sum(1 for g in gaps if g > threshold)
+
+
+def _amount_variability(amounts: list[float]) -> float | None:
+    if len(amounts) < 2:
+        return None
+    med = _median(amounts)
+    if med is None:
+        return None
+    dev = [abs(a - med) for a in amounts]
+    if not dev:
+        return None
+    return float(sorted(dev)[len(dev) // 2])
+
+
 def _roll_forward(date_val, gap_days: int, *, today):
     """
     If last+gap is in the past (missed cycles), roll forward a few cycles.
@@ -175,6 +198,8 @@ def _confidence_and_reasons(
     dates,
     median_gap: int | None,
     variability: int | None,
+    amount_variability: float | None,
+    skipped_cycles: int,
     flagged_count: int,
     last_date,
     amount_median: float | None,
@@ -216,6 +241,15 @@ def _confidence_and_reasons(
     if amount_median is not None:
         score += 0.05
         reasons.append("Charge amount is available.")
+        if amount_variability is not None:
+            if amount_variability <= max(0.5, amount_median * 0.03):
+                score += 0.05
+                reasons.append("Charge amounts are consistent.")
+            else:
+                reasons.append("Charge amounts vary across cycles.")
+
+    if skipped_cycles > 0:
+        reasons.append(f"{skipped_cycles} longer-than-usual gap(s) in charges detected.")
 
     # clamp
     score = max(0.0, min(1.0, score))
@@ -252,20 +286,21 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
         .filter(Subscription.user_id == user_id, Subscription.status == SubscriptionStatus.ignored)
         .all()
     )
-    ignored_keys: set[tuple[str, float | None]] = set()
+    ignored_keys: set[tuple[str, float | None, str | None]] = set()
     for s in ignored:
         vkey = _normalize_vendor(getattr(s, "vendor_name", "") or "")
         amt = _amount_to_float(getattr(s, "amount", None))
-        ignored_keys.add((vkey, amt))
+        ignored_keys.add((vkey, amt, getattr(s, "currency", None)))
 
     # Group transactions by normalized vendor
-    vendor_groups: dict[str, list[Transaction]] = defaultdict(list)
+    vendor_groups: dict[tuple[str, str | None], list[Transaction]] = defaultdict(list)
     for tx in txs:
         v = getattr(tx, "vendor", None)
         d = getattr(tx, "transaction_date", None)
         if not v or not d:
             continue
-        vendor_groups[_normalize_vendor(v)].append(tx)
+        currency = getattr(tx, "currency", None)
+        vendor_groups[(_normalize_vendor(v), currency)].append(tx)
 
     # Delete old subscriptions except ignored
     before = db.query(Subscription).filter(Subscription.user_id == user_id).count()
@@ -276,7 +311,7 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
 
     created = 0
 
-    for vendor_key, items in vendor_groups.items():
+    for (vendor_key, vendor_currency), items in vendor_groups.items():
         if not vendor_key:
             continue
 
@@ -290,7 +325,7 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
             amount_median = _median(amounts)
 
             # Skip if user previously ignored this vendor+amount
-            if (vendor_key, amount_median) in ignored_keys:
+            if (vendor_key, amount_median, vendor_currency) in ignored_keys:
                 continue
 
             dates = _date_list(cluster_items)
@@ -312,6 +347,7 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
                 median_gap = None
 
             variability = _gap_variability_days(dates, median_gap) if median_gap else None
+            skipped_cycles = _gap_skipped_cycles(dates, median_gap) if median_gap else 0
 
             last_date = max(dates)
 
@@ -365,10 +401,13 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
                     kind = "active"
 
             # Explainability
+            amount_variability = _amount_variability(amounts) if amounts else None
             confidence, reasons = _confidence_and_reasons(
                 dates=dates,
                 median_gap=median_gap,
                 variability=variability,
+                amount_variability=amount_variability,
+                skipped_cycles=skipped_cycles,
                 flagged_count=len(flagged),
                 last_date=last_date,
                 amount_median=amount_median,
@@ -416,6 +455,8 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
                         # cadence (old + new keys)
                         "median_gap_days": median_gap,
                         "gap_variability_days": variability,
+                        "skipped_cycles": skipped_cycles,
+                        "amount_variability": amount_variability,
                         "cadence_days": median_gap,
                         "cadence_variance_days": variability,
 
