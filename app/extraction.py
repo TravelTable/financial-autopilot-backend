@@ -40,6 +40,24 @@ def get_plain_text_parts(payload: dict) -> str:
     walk(payload or {})
     return "\n".join(texts)
 
+def get_html_parts(payload: dict) -> str:
+    import base64
+    texts: list[str] = []
+    def walk(part: dict):
+        mime = part.get("mimeType", "")
+        body = part.get("body", {}) or {}
+        data = body.get("data")
+        if mime == "text/html" and data:
+            try:
+                txt = base64.urlsafe_b64decode(data.encode("utf-8")).decode("utf-8", errors="ignore")
+                texts.append(txt)
+            except Exception:
+                pass
+        for p in part.get("parts", []) or []:
+            walk(p)
+    walk(payload or {})
+    return "\n".join(texts)
+
 def rules_extract(message: dict) -> dict[str, Any]:
     headers = extract_headers(message)
     subject = headers.get("subject", "")
@@ -63,7 +81,22 @@ def rules_extract(message: dict) -> dict[str, Any]:
         tx_date = datetime.fromtimestamp(internal_date_ms / 1000, tz=timezone.utc).date()
 
     blob = (subject + " " + snippet).lower()
-    is_sub = any(k in blob for k in ["subscription", "renewal", "trial", "free trial", "recurring", "membership"])
+    is_sub = any(
+        k in blob
+        for k in [
+            "subscription",
+            "renewal",
+            "trial",
+            "free trial",
+            "recurring",
+            "membership",
+            "subscribe",
+            "plan",
+            "auto-renew",
+            "active subscription",
+            "subscribed",
+        ]
+    )
 
     cat = None
     if any(k in blob for k in ["uber", "lyft", "taxi"]):

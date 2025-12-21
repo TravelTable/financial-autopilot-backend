@@ -64,6 +64,7 @@ class GoogleAccount(Base):
 
     user = relationship("User", back_populates="google_accounts")
     emails = relationship("EmailIndex", back_populates="google_account", cascade="all, delete-orphan")
+    raw_emails = relationship("EmailRaw", back_populates="google_account", cascade="all, delete-orphan")
 
     __table_args__ = (UniqueConstraint("user_id", "google_user_id", name="uq_user_google"),)
 
@@ -88,6 +89,26 @@ class EmailIndex(Base):
     google_account = relationship("GoogleAccount", back_populates="emails")
 
     __table_args__ = (UniqueConstraint("google_account_id", "gmail_message_id", name="uq_gmail_msg"),)
+
+
+class EmailRaw(Base):
+    __tablename__ = "emails_raw"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    google_account_id: Mapped[int] = mapped_column(ForeignKey("google_accounts.id"), index=True)
+
+    gmail_message_id: Mapped[str] = mapped_column(String(128), index=True)
+    gmail_thread_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+    internal_date_ms: Mapped[int] = mapped_column(BigInteger)
+    headers_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    snippet: Mapped[str | None] = mapped_column(Text, nullable=True)
+    text_plain: Mapped[str | None] = mapped_column(Text, nullable=True)
+    text_html: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    google_account = relationship("GoogleAccount", back_populates="raw_emails")
+
+    __table_args__ = (UniqueConstraint("google_account_id", "gmail_message_id", name="uq_raw_gmail_msg"),)
 
 
 class Vendor(Base):

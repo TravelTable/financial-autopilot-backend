@@ -12,10 +12,10 @@ from sqlalchemy.orm import Session
 from app.alerts import schedule_alerts
 from app.config import settings
 from app.db import SessionLocal
-from app.extraction import extract_headers, get_plain_text_parts, rules_extract
+from app.extraction import extract_headers, get_html_parts, get_plain_text_parts, rules_extract
 from app.gmail_client import build_gmail_service, get_message, list_messages
 from app.llm import get_llm
-from app.models import AuditLog, EmailIndex, GoogleAccount, Transaction
+from app.models import AuditLog, EmailIndex, EmailRaw, GoogleAccount, Transaction
 from app.security import token_cipher
 from app.subscriptions import recompute_subscriptions
 from app.worker.celery_app import celery_app
@@ -114,6 +114,11 @@ _SUBJECT_HINTS = (
     "order confirmation",
     "thank you for",
     "billing",
+    "membership",
+    "plan",
+    "auto-renew",
+    "subscribe",
+    "active subscription",
 )
 
 
@@ -203,10 +208,12 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
             return {"ok": False, "error": "account not found"}
 
         refresh = token_cipher.decrypt(acct.refresh_token_enc)
-        days = int(lookback_days or settings.SYNC_LOOKBACK_DAYS)
-        since_date = (datetime.now(timezone.utc) - timedelta(days=days)).date()
-
-        q = f"{settings.GMAIL_QUERY} after:{since_date.strftime('%Y/%m/%d')}"
+        if lookback_days is None:
+            q = settings.GMAIL_QUERY
+        else:
+            days = int(lookback_days or settings.SYNC_LOOKBACK_DAYS)
+            since_date = (datetime.now(timezone.utc) - timedelta(days=days)).date()
+            q = f"{settings.GMAIL_QUERY} after:{since_date.strftime('%Y/%m/%d')}"
         logger.info("sync_user gmail query=%s", q)
 
         svc = build_gmail_service(
@@ -245,6 +252,10 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
 
                 full = _gmail_get_message_with_retry(svc, mid, format="full")
                 headers = extract_headers(full)
+                payload = full.get("payload", {}) or {}
+                text_plain = get_plain_text_parts(payload) or ""
+                text_html = get_html_parts(payload) or ""
+                snippet = full.get("snippet", "") or ""
 
                 internal_ms_raw = full.get("internalDate", "0")
                 try:
@@ -261,6 +272,18 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                         from_email=headers.get("from"),
                         subject=headers.get("subject"),
                         processed=False,
+                    )
+                )
+                db.add(
+                    EmailRaw(
+                        google_account_id=acct.id,
+                        gmail_message_id=mid,
+                        gmail_thread_id=full.get("threadId"),
+                        internal_date_ms=internal_ms,
+                        headers_json=payload.get("headers", []) or [],
+                        snippet=snippet,
+                        text_plain=text_plain,
+                        text_html=text_html,
                     )
                 )
                 indexed_new += 1
@@ -315,9 +338,38 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                 extracted = rules_extract(full)
 
                 payload = full.get("payload", {}) or {}
-                text = get_plain_text_parts(payload) or ""
+                text_plain = get_plain_text_parts(payload) or ""
+                text_html = get_html_parts(payload) or ""
+                text = text_plain or text_html or ""
                 headers = extract_headers(full)
                 snippet = full.get("snippet", "") or ""
+
+                raw_exists = (
+                    db.query(EmailRaw)
+                    .filter(
+                        EmailRaw.google_account_id == acct.id,
+                        EmailRaw.gmail_message_id == idx.gmail_message_id,
+                    )
+                    .first()
+                )
+                if not raw_exists:
+                    internal_ms_raw = full.get("internalDate", "0")
+                    try:
+                        internal_ms = int(internal_ms_raw)
+                    except Exception:
+                        internal_ms = 0
+                    db.add(
+                        EmailRaw(
+                            google_account_id=acct.id,
+                            gmail_message_id=idx.gmail_message_id,
+                            gmail_thread_id=full.get("threadId"),
+                            internal_date_ms=internal_ms,
+                            headers_json=payload.get("headers", []) or [],
+                            snippet=snippet,
+                            text_plain=text_plain,
+                            text_html=text_html,
+                        )
+                    )
 
                 llm_used = False
                 llm_error = None
