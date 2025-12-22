@@ -152,6 +152,15 @@ def _is_llm_candidate(*, headers: dict, snippet: str, text: str, extracted: dict
     return False
 
 
+def _is_bulk_mail(headers: dict) -> bool:
+    """
+    Detect bulk/marketing email by common headers.
+    """
+    list_unsubscribe = headers.get("list-unsubscribe")
+    precedence = (headers.get("precedence") or "").lower()
+    return bool(list_unsubscribe) and "bulk" in precedence
+
+
 def _run_async(coro):
     """
     Run an async coroutine from a sync Celery worker safely.
@@ -343,6 +352,18 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                 text = text_plain or text_html or ""
                 headers = extract_headers(full)
                 snippet = full.get("snippet", "") or ""
+
+                if _is_bulk_mail(headers):
+                    logger.info(
+                        "sync_user bulk mail skipped gmail_message_id=%s subject=%s from=%s",
+                        idx.gmail_message_id,
+                        headers.get("subject"),
+                        headers.get("from"),
+                    )
+                    idx.processed = True
+                    idx.processed_at = datetime.now(timezone.utc)
+                    processed += 1
+                    continue
 
                 raw_exists = (
                     db.query(EmailRaw)
