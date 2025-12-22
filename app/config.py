@@ -29,6 +29,9 @@ class Settings(BaseSettings):
     OPENAI_MODEL: str = "gpt-4.0"
 
     SYNC_LOOKBACK_DAYS: int = 90
-    GMAIL_QUERY: str = '(receipt OR invoice OR "payment received" OR "subscription" OR "renewal" OR "trial" OR "order confirmation")'
+    GMAIL_QUERY: str = (
+        '(receipt OR invoice OR "payment received" OR "subscription" OR "renewal" OR "trial" OR "order confirmation") '
+        "-category:promotions -category:social"
+    )
 
 settings = Settings()
