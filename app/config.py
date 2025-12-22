@@ -29,6 +29,18 @@ class Settings(BaseSettings):
     OPENAI_MODEL: str = "gpt-4.0"
 
     SYNC_LOOKBACK_DAYS: int = 90
-    GMAIL_QUERY: str = '(receipt OR invoice OR "payment received" OR "subscription" OR "renewal" OR "trial" OR "order confirmation")'
+    GMAIL_QUERY_BASE: str = (
+        '(receipt OR invoice OR "payment received" OR "subscription" OR "renewal" OR "trial" OR "order confirmation")'
+    )
+    GMAIL_EXCLUDED_CATEGORIES: str = "promotions social"
+    GMAIL_QUERY: str = ""
+
+    def model_post_init(self, __context) -> None:
+        excluded_categories = " ".join(
+            f"-category:{category}"
+            for category in self.GMAIL_EXCLUDED_CATEGORIES.split()
+            if category
+        )
+        self.GMAIL_QUERY = f"{self.GMAIL_QUERY_BASE} {excluded_categories}".strip()
 
 settings = Settings()
