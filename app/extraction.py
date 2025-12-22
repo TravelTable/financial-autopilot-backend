@@ -58,7 +58,43 @@ def get_html_parts(payload: dict) -> str:
     walk(payload or {})
     return "\n".join(texts)
 
-def rules_extract(message: dict) -> dict[str, Any]:
+def _is_apple_receipt(subject: str, from_h: str) -> bool:
+    subj = subject.lower()
+    sender = from_h.lower()
+    if not (
+        any(k in sender for k in ["apple.com", "itunes.com", "apple", "appstore"])
+        or "apple" in subj
+    ):
+        return False
+    return any(k in subj for k in ["receipt", "invoice", "your order", "app store", "purchase"])
+
+
+def _is_total_line(text: str) -> bool:
+    lower = text.lower()
+    return any(k in lower for k in ["total", "subtotal", "tax", "balance", "amount charged"])
+
+
+def _apple_item_from_text(text_plain: str) -> tuple[str | None, float | None, str | None]:
+    if not text_plain:
+        return None, None, None
+    lines = [line.strip() for line in text_plain.splitlines()]
+    previous = ""
+    for line in lines:
+        if not line:
+            continue
+        for m in AMOUNT_RE.finditer(line):
+            desc = line[: m.start()].strip(" -:\t")
+            if not desc and previous:
+                desc = previous.strip(" -:\t")
+            if desc and not _is_total_line(desc) and not _is_total_line(line):
+                currency = CURRENCY_MAP.get(m.group("currency").upper(), CURRENCY_MAP.get(m.group("currency"), None))
+                amount = _safe_float(m.group("amount"))
+                return desc[:256], amount, currency
+        previous = line
+    return None, None, None
+
+
+def rules_extract(message: dict, *, text_plain: str = "") -> dict[str, Any]:
     headers = extract_headers(message)
     subject = headers.get("subject", "")
     from_h = headers.get("from", "")
@@ -74,6 +110,15 @@ def rules_extract(message: dict) -> dict[str, Any]:
     if m:
         currency = CURRENCY_MAP.get(m.group("currency").upper(), CURRENCY_MAP.get(m.group("currency"), None))
         amount = _safe_float(m.group("amount"))
+
+    if _is_apple_receipt(subject, from_h):
+        item_vendor, item_amount, item_currency = _apple_item_from_text(text_plain)
+        if item_vendor:
+            vendor = item_vendor
+        if amount is None and item_amount is not None:
+            amount = item_amount
+        if currency is None and item_currency:
+            currency = item_currency
 
     internal_date_ms = int(message.get("internalDate", "0"))
     tx_date = None
