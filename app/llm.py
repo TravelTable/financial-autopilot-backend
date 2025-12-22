@@ -4,15 +4,39 @@ import httpx
 from app.config import settings
 
 class LLM(Protocol):
-    async def extract_transaction(self, *, email_subject: str, email_from: str, email_snippet: str, email_text: str) -> dict[str, Any] | None:
+    async def extract_transaction(
+        self,
+        *,
+        email_subject: str,
+        email_from: str,
+        email_snippet: str,
+        email_text: str,
+        email_list_unsubscribe: str | None = None,
+    ) -> dict[str, Any] | None:
         ...
 
 class NoopLLM:
-    async def extract_transaction(self, *, email_subject: str, email_from: str, email_snippet: str, email_text: str) -> dict[str, Any] | None:
+    async def extract_transaction(
+        self,
+        *,
+        email_subject: str,
+        email_from: str,
+        email_snippet: str,
+        email_text: str,
+        email_list_unsubscribe: str | None = None,
+    ) -> dict[str, Any] | None:
         return None
 
 class OpenAIChatCompletionsLLM:
-    async def extract_transaction(self, *, email_subject: str, email_from: str, email_snippet: str, email_text: str) -> dict[str, Any] | None:
+    async def extract_transaction(
+        self,
+        *,
+        email_subject: str,
+        email_from: str,
+        email_snippet: str,
+        email_text: str,
+        email_list_unsubscribe: str | None = None,
+    ) -> dict[str, Any] | None:
         if not settings.OPENAI_API_KEY:
             return None
 
@@ -24,6 +48,8 @@ class OpenAIChatCompletionsLLM:
             "mark marketing offers or solicitations as subscriptions. "
             "Example (promo): 'Try Premium for 30% off' -> is_subscription false. "
             "Example (receipt): 'Your Pro plan is now active' -> is_subscription true. "
+            "If LIST_UNSUBSCRIBE is present, treat the email as promotional unless it clearly "
+            "confirms a charge with an amount or explicit renewal/trial date. "
             "When you find one, set is_subscription to true and extract any mentioned "
             "trial_end_date or renewal_date. "
             "Return ONLY JSON with schema: "
@@ -32,6 +58,7 @@ class OpenAIChatCompletionsLLM:
         user = f"""EMAIL_FROM: {email_from}
 EMAIL_SUBJECT: {email_subject}
 EMAIL_SNIPPET: {email_snippet}
+LIST_UNSUBSCRIBE: {email_list_unsubscribe or ""}
 EMAIL_TEXT: {email_text[:6000]}
 """
 
