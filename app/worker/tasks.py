@@ -121,6 +121,25 @@ _SUBJECT_HINTS = (
     "active subscription",
 )
 
+_TRANSACTION_HINTS = (
+    "receipt",
+    "invoice",
+    "payment received",
+    "order confirmation",
+    "charged",
+    "payment",
+    "billing",
+    "purchase",
+    "order",
+)
+
+
+def _is_marketing_message(headers: dict) -> bool:
+    if "list-unsubscribe" in headers or "list-unsubscribe-post" in headers:
+        return True
+    precedence = (headers.get("precedence") or "").lower()
+    return precedence in {"bulk", "list", "junk"}
+
 
 def _is_llm_candidate(*, headers: dict, snippet: str, text: str, extracted: dict) -> bool:
     """
@@ -133,6 +152,14 @@ def _is_llm_candidate(*, headers: dict, snippet: str, text: str, extracted: dict
 
     subj = (headers.get("subject") or "").lower()
     snip = (snippet or "").lower()
+    has_marketing_headers = _is_marketing_message(headers)
+    has_transaction_hints = any(h in subj for h in _TRANSACTION_HINTS) or any(h in snip for h in _TRANSACTION_HINTS)
+
+    if has_marketing_headers and not has_transaction_hints:
+        has_amount = extracted.get("amount") not in (None, "")
+        has_dates = extracted.get("trial_end_date") or extracted.get("renewal_date")
+        if not (has_amount or has_dates):
+            return False
 
     # Strong hints in subject/snippet
     if any(h in subj for h in _SUBJECT_HINTS) or any(h in snip for h in _SUBJECT_HINTS):
@@ -427,6 +454,14 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                 conf_obj.setdefault("source", "llm+rules" if llm_used else "rules")
                 if llm_error:
                     conf_obj["llm_error"] = llm_error
+                if _is_marketing_message(headers):
+                    conf_obj["marketing_header"] = True
+
+                is_subscription = bool(extracted.get("is_subscription", False))
+                if conf_obj.get("marketing_header") and is_subscription:
+                    if not (amount or trial_end or renewal_date):
+                        is_subscription = False
+                        conf_obj["marketing_suspect"] = True
 
                 db.add(
                     Transaction(
@@ -438,7 +473,7 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                         currency=currency,
                         transaction_date=tx_date,
                         category=extracted.get("category"),
-                        is_subscription=bool(extracted.get("is_subscription", False)),
+                        is_subscription=is_subscription,
                         trial_end_date=trial_end,
                         renewal_date=renewal_date,
                         confidence=conf_obj,
