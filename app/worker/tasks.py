@@ -157,8 +157,13 @@ def _is_bulk_mail(headers: dict) -> bool:
     Detect bulk/marketing email by common headers.
     """
     list_unsubscribe = headers.get("list-unsubscribe")
+    list_id = headers.get("list-id")
     precedence = (headers.get("precedence") or "").lower()
-    return bool(list_unsubscribe) and "bulk" in precedence
+    return bool(list_unsubscribe or list_id) or ("bulk" in precedence or "list" in precedence)
+
+
+def _subscription_has_concrete_evidence(*, amount: float | None, trial_end: date | None, renewal_date: date | None) -> bool:
+    return bool(amount is not None or trial_end or renewal_date)
 
 
 def _run_async(coro):
@@ -404,6 +409,7 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                                 email_from=headers.get("from", ""),
                                 email_snippet=snippet,
                                 email_text=text,
+                                email_list_unsubscribe=headers.get("list-unsubscribe"),
                             )
                         )
                         llm_used = True
@@ -439,6 +445,11 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                 tx_date = _to_date(extracted.get("transaction_date"))
                 trial_end = _to_date(extracted.get("trial_end_date"))
                 renewal_date = _to_date(extracted.get("renewal_date"))
+                is_subscription = bool(extracted.get("is_subscription", False))
+                if is_subscription and not _subscription_has_concrete_evidence(
+                    amount=amount, trial_end=trial_end, renewal_date=renewal_date
+                ):
+                    is_subscription = False
 
                 # Store confidence as JSON, and record provenance (rules vs llm)
                 conf_obj = extracted.get("confidence")
@@ -448,6 +459,8 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                 conf_obj.setdefault("source", "llm+rules" if llm_used else "rules")
                 if llm_error:
                     conf_obj["llm_error"] = llm_error
+                if extracted.get("is_subscription") and not is_subscription:
+                    conf_obj["subscription_downgraded"] = "missing_amount_or_dates"
 
                 db.add(
                     Transaction(
@@ -459,7 +472,7 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                         currency=currency,
                         transaction_date=tx_date,
                         category=extracted.get("category"),
-                        is_subscription=bool(extracted.get("is_subscription", False)),
+                        is_subscription=is_subscription,
                         trial_end_date=trial_end,
                         renewal_date=renewal_date,
                         confidence=conf_obj,
