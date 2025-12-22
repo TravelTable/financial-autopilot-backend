@@ -364,7 +364,7 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                 text = text_plain or text_html or ""
                 headers = extract_headers(full)
                 snippet = full.get("snippet", "") or ""
-                extracted = rules_extract(full, text_plain=text_plain)
+                extracted = rules_extract(full, text_plain=text_plain, text_html=text_html)
 
                 if headers.get("list-unsubscribe"):
                     logger.info(
