@@ -335,7 +335,6 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                     continue
 
                 full = _gmail_get_message_with_retry(svc, idx.gmail_message_id, format="full")
-                extracted = rules_extract(full)
 
                 payload = full.get("payload", {}) or {}
                 text_plain = get_plain_text_parts(payload) or ""
@@ -343,6 +342,7 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                 text = text_plain or text_html or ""
                 headers = extract_headers(full)
                 snippet = full.get("snippet", "") or ""
+                extracted = rules_extract(full, text_plain=text_plain)
 
                 raw_exists = (
                     db.query(EmailRaw)
