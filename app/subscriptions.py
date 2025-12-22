@@ -381,7 +381,10 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
                 # Too weird to treat as recurring
                 median_gap = None
 
-            if len(dates) == 1 or median_gap is None:
+            if len(dates) == 1:
+                if not (trial_evidence or renewal_evidence):
+                    continue
+            elif median_gap is None:
                 if not concrete_evidence:
                     continue
 
