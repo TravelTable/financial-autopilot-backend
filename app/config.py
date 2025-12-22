@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     LLM_PROVIDER: str = "none"  # none | openai_chat_completions
     OPENAI_API_KEY: str = ""
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"
-    OPENAI_MODEL: str = "gpt-4o-mini"
+    OPENAI_MODEL: str = "gpt-4.0"
 
     SYNC_LOOKBACK_DAYS: int = 90
     GMAIL_QUERY: str = '(receipt OR invoice OR "payment received" OR "subscription" OR "renewal" OR "trial" OR "order confirmation")'

@@ -25,7 +25,7 @@ def extract_transaction_from_email(text: str) -> dict:
     Takes a *single* email body (plain text) and returns structured data.
     """
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.0",
         temperature=0,
         messages=[
             {
@@ -51,4 +51,3 @@ def extract_transaction_from_email(text: str) -> dict:
     )
 
     return response.choices[0].message.parsed
-
