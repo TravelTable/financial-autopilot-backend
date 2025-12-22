@@ -178,6 +178,15 @@ def _amount_variability(amounts: list[float]) -> float | None:
     return float(sorted(dev)[len(dev) // 2])
 
 
+def _has_strong_subscription_evidence(items: Iterable[Transaction]) -> bool:
+    for t in items:
+        if getattr(t, "trial_end_date", None) or getattr(t, "renewal_date", None):
+            return True
+        if getattr(t, "is_subscription", False) and getattr(t, "amount", None) is not None:
+            return True
+    return False
+
+
 def _roll_forward(date_val, gap_days: int, *, today):
     """
     If last+gap is in the past (missed cycles), roll forward a few cycles.
@@ -376,6 +385,8 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
             if next_renewal is None:
                 # If we don't have a next date, only create a sub if we have strong flagged evidence.
                 if not flagged:
+                    continue
+                if len(dates) <= 1 and not _has_strong_subscription_evidence(flagged):
                     continue
 
             # Status logic:
