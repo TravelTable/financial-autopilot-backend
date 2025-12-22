@@ -19,8 +19,13 @@ class OpenAIChatCompletionsLLM:
         system = (
             "Extract structured purchase/subscription info from emails. "
             "Look for subscription phrases like 'membership', 'plan', 'auto-renew', "
-            "'active subscription', etc. When you find one, set is_subscription to true "
-            "and extract any mentioned trial_end_date or renewal_date. "
+            "'active subscription', etc. Only set is_subscription when the email "
+            "confirms an actual purchase/subscription/trial the user has. Do not "
+            "mark marketing offers or solicitations as subscriptions. "
+            "Example (promo): 'Try Premium for 30% off' -> is_subscription false. "
+            "Example (receipt): 'Your Pro plan is now active' -> is_subscription true. "
+            "When you find one, set is_subscription to true and extract any mentioned "
+            "trial_end_date or renewal_date. "
             "Return ONLY JSON with schema: "
             "{vendor, amount, currency, transaction_date (YYYY-MM-DD), category, is_subscription, trial_end_date, renewal_date, confidence:{vendor,amount,date}}"
         )
