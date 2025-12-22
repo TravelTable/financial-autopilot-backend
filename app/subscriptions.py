@@ -65,6 +65,24 @@ def _median(nums: list[float]) -> float | None:
     return (s[mid - 1] + s[mid]) / 2.0
 
 
+_MIN_EVIDENCE_CONFIDENCE = 0.5
+
+
+def _meets_confidence(tx: Transaction, key: str, minimum: float | None) -> bool:
+    if minimum is None:
+        return True
+    confidence = getattr(tx, "confidence", None)
+    if not isinstance(confidence, dict):
+        return True
+    value = confidence.get(key)
+    if value is None:
+        return True
+    try:
+        return float(value) >= minimum
+    except (TypeError, ValueError):
+        return True
+
+
 def _cluster_by_amount(
     items: list[Transaction],
     *,
@@ -340,11 +358,32 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
                 or getattr(t, "renewal_date", None)
             ]
 
+            amount_evidence = any(
+                _amount_to_float(getattr(t, "amount", None)) is not None
+                and _meets_confidence(t, "amount", _MIN_EVIDENCE_CONFIDENCE)
+                for t in cluster_items
+            )
+            trial_evidence = any(
+                getattr(t, "trial_end_date", None)
+                and _meets_confidence(t, "date", _MIN_EVIDENCE_CONFIDENCE)
+                for t in cluster_items
+            )
+            renewal_evidence = any(
+                getattr(t, "renewal_date", None)
+                and _meets_confidence(t, "date", _MIN_EVIDENCE_CONFIDENCE)
+                for t in cluster_items
+            )
+            concrete_evidence = amount_evidence or trial_evidence or renewal_evidence
+
             # Cadence inference (if possible)
             median_gap = _median_gap_days(dates)
             if median_gap is not None and (median_gap < 7 or median_gap > 400):
                 # Too weird to treat as recurring
                 median_gap = None
+
+            if len(dates) == 1 or median_gap is None:
+                if not concrete_evidence:
+                    continue
 
             variability = _gap_variability_days(dates, median_gap) if median_gap else None
             skipped_cycles = _gap_skipped_cycles(dates, median_gap) if median_gap else 0
