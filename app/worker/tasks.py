@@ -266,6 +266,14 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
 
                 full = _gmail_get_message_with_retry(svc, mid, format="full")
                 headers = extract_headers(full)
+                if headers.get("list-unsubscribe"):
+                    logger.info(
+                        "sync_user list-unsubscribe skipped gmail_message_id=%s subject=%s from=%s",
+                        mid,
+                        headers.get("subject"),
+                        headers.get("from"),
+                    )
+                    continue
                 payload = full.get("payload", {}) or {}
                 text_plain = get_plain_text_parts(payload) or ""
                 text_html = get_html_parts(payload) or ""
@@ -358,6 +366,18 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                 snippet = full.get("snippet", "") or ""
                 extracted = rules_extract(full, text_plain=text_plain)
 
+                if headers.get("list-unsubscribe"):
+                    logger.info(
+                        "sync_user list-unsubscribe skipped gmail_message_id=%s subject=%s from=%s",
+                        idx.gmail_message_id,
+                        headers.get("subject"),
+                        headers.get("from"),
+                    )
+                    idx.processed = True
+                    idx.processed_at = datetime.now(timezone.utc)
+                    processed += 1
+                    continue
+
                 if _is_bulk_mail(headers):
                     logger.info(
                         "sync_user bulk mail skipped gmail_message_id=%s subject=%s from=%s",
@@ -399,12 +419,14 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
 
                 llm_used = False
                 llm_error = None
+                llm_classification = None
+                ai = None
 
                 # Optional LLM enrichment (gated)
                 if _is_llm_candidate(headers=headers, snippet=snippet, text=text, extracted=extracted):
                     try:
-                        ai = _run_async(
-                            llm.extract_transaction(
+                        llm_classification = _run_async(
+                            llm.classify_receipt(
                                 email_subject=headers.get("subject", ""),
                                 email_from=headers.get("from", ""),
                                 email_snippet=snippet,
@@ -412,7 +434,17 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                                 email_list_unsubscribe=headers.get("list-unsubscribe"),
                             )
                         )
-                        llm_used = True
+                        if llm_classification is not False:
+                            ai = _run_async(
+                                llm.extract_transaction(
+                                    email_subject=headers.get("subject", ""),
+                                    email_from=headers.get("from", ""),
+                                    email_snippet=snippet,
+                                    email_text=text,
+                                    email_list_unsubscribe=headers.get("list-unsubscribe"),
+                                )
+                            )
+                            llm_used = True
                         if isinstance(ai, dict):
                             # Only overwrite if AI provides a meaningful value
                             for k in [
@@ -459,6 +491,8 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                 conf_obj.setdefault("source", "llm+rules" if llm_used else "rules")
                 if llm_error:
                     conf_obj["llm_error"] = llm_error
+                if llm_classification is False:
+                    conf_obj["llm_classification"] = "not_receipt"
                 if extracted.get("is_subscription") and not is_subscription:
                     conf_obj["subscription_downgraded"] = "missing_amount_or_dates"
 

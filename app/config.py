@@ -30,7 +30,7 @@ class Settings(BaseSettings):
 
     SYNC_LOOKBACK_DAYS: int = 90
     GMAIL_QUERY_BASE: str = (
-        '(receipt OR invoice OR "payment received" OR "subscription" OR "renewal" OR "trial" OR "order confirmation")'
+        '(receipt OR invoice OR "payment received" OR "subscription" OR "renewal" OR "trial" OR "order confirmation") "$"'
     )
     GMAIL_EXCLUDED_CATEGORIES: str = "promotions social"
     GMAIL_QUERY: str = ""

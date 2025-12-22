@@ -94,6 +94,26 @@ def _apple_item_from_text(text_plain: str) -> tuple[str | None, float | None, st
     return None, None, None
 
 
+def _apple_vendor_from_text(text_plain: str) -> str | None:
+    if not text_plain:
+        return None
+    pattern = re.compile(r"([A-Za-z0-9 .+&-]+)\s+\$?\s*\d{1,6}[.,]\d{2}")
+    lines = [line.strip() for line in text_plain.splitlines()]
+    previous = ""
+    for line in lines:
+        if not line:
+            continue
+        m = pattern.search(line)
+        if m:
+            candidate = m.group(1).strip(" -:\t")
+            if not candidate and previous:
+                candidate = previous.strip(" -:\t")
+            if candidate and not _is_total_line(candidate) and not _is_total_line(line):
+                return candidate[:256]
+        previous = line
+    return None
+
+
 def rules_extract(message: dict, *, text_plain: str = "") -> dict[str, Any]:
     headers = extract_headers(message)
     subject = headers.get("subject", "")
@@ -119,6 +139,10 @@ def rules_extract(message: dict, *, text_plain: str = "") -> dict[str, Any]:
             amount = item_amount
         if currency is None and item_currency:
             currency = item_currency
+    elif vendor and vendor.strip().lower().startswith("apple"):
+        apple_vendor = _apple_vendor_from_text(text_plain)
+        if apple_vendor:
+            vendor = apple_vendor
 
     internal_date_ms = int(message.get("internalDate", "0"))
     tx_date = None
