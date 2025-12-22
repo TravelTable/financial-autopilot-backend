@@ -74,10 +74,30 @@ def _is_total_line(text: str) -> bool:
     return any(k in lower for k in ["total", "subtotal", "tax", "balance", "amount charged"])
 
 
-def _apple_item_from_text(text_plain: str) -> tuple[str | None, float | None, str | None]:
-    if not text_plain:
+def _html_to_text(text_html: str) -> str:
+    if not text_html:
+        return ""
+    import html as html_lib
+    text = re.sub(r"(?i)<\s*br\s*/?>", "\n", text_html)
+    text = re.sub(r"(?i)</p>", "\n", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return html_lib.unescape(text)
+
+
+def _combined_text(text_plain: str, text_html: str) -> str:
+    combined = []
+    if text_plain:
+        combined.append(text_plain)
+    if text_html:
+        combined.append(_html_to_text(text_html))
+    return "\n".join(filter(None, combined))
+
+
+def _apple_item_from_text(text_plain: str, text_html: str = "") -> tuple[str | None, float | None, str | None]:
+    text = _combined_text(text_plain, text_html)
+    if not text:
         return None, None, None
-    lines = [line.strip() for line in text_plain.splitlines()]
+    lines = [line.strip() for line in text.splitlines()]
     previous = ""
     for line in lines:
         if not line:
@@ -94,15 +114,22 @@ def _apple_item_from_text(text_plain: str) -> tuple[str | None, float | None, st
     return None, None, None
 
 
-def _apple_vendor_from_text(text_plain: str) -> str | None:
-    if not text_plain:
+def _apple_vendor_from_text(text_plain: str, text_html: str = "") -> str | None:
+    text = _combined_text(text_plain, text_html)
+    if not text:
         return None
+    label_pattern = re.compile(r"\b(?:item|subscription)\b\s*[:\-]\s*(.+)", re.I)
     pattern = re.compile(r"([A-Za-z0-9 .+&-]+)\s+\$?\s*\d{1,6}[.,]\d{2}")
-    lines = [line.strip() for line in text_plain.splitlines()]
+    lines = [line.strip() for line in text.splitlines()]
     previous = ""
     for line in lines:
         if not line:
             continue
+        label_match = label_pattern.search(line)
+        if label_match:
+            candidate = label_match.group(1).strip(" -:\t")
+            if candidate and not _is_total_line(candidate) and not _is_total_line(line):
+                return candidate[:256]
         m = pattern.search(line)
         if m:
             candidate = m.group(1).strip(" -:\t")
@@ -114,7 +141,7 @@ def _apple_vendor_from_text(text_plain: str) -> str | None:
     return None
 
 
-def rules_extract(message: dict, *, text_plain: str = "") -> dict[str, Any]:
+def rules_extract(message: dict, *, text_plain: str = "", text_html: str = "") -> dict[str, Any]:
     headers = extract_headers(message)
     subject = headers.get("subject", "")
     from_h = headers.get("from", "")
@@ -132,7 +159,7 @@ def rules_extract(message: dict, *, text_plain: str = "") -> dict[str, Any]:
         amount = _safe_float(m.group("amount"))
 
     if _is_apple_receipt(subject, from_h):
-        item_vendor, item_amount, item_currency = _apple_item_from_text(text_plain)
+        item_vendor, item_amount, item_currency = _apple_item_from_text(text_plain, text_html)
         if item_vendor:
             vendor = item_vendor
         if amount is None and item_amount is not None:
@@ -140,7 +167,7 @@ def rules_extract(message: dict, *, text_plain: str = "") -> dict[str, Any]:
         if currency is None and item_currency:
             currency = item_currency
     elif vendor and vendor.strip().lower().startswith("apple"):
-        apple_vendor = _apple_vendor_from_text(text_plain)
+        apple_vendor = _apple_vendor_from_text(text_plain, text_html)
         if apple_vendor:
             vendor = apple_vendor
 
