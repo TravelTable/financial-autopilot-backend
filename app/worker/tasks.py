@@ -225,9 +225,12 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
         if lookback_days is None:
             q = settings.GMAIL_QUERY
         else:
-            days = int(lookback_days or settings.SYNC_LOOKBACK_DAYS)
-            since_date = (datetime.now(timezone.utc) - timedelta(days=days)).date()
-            q = f"{settings.GMAIL_QUERY} after:{since_date.strftime('%Y/%m/%d')}"
+            days = int(lookback_days)
+            if days <= 0:
+                q = settings.GMAIL_QUERY
+            else:
+                since_date = (datetime.now(timezone.utc) - timedelta(days=days)).date()
+                q = f"{settings.GMAIL_QUERY} after:{since_date.strftime('%Y/%m/%d')}"
         logger.info("sync_user gmail query=%s", q)
 
         svc = build_gmail_service(
