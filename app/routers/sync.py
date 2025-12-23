@@ -22,6 +22,12 @@ def start_sync(
     if not acct:
         raise HTTPException(status_code=400, detail="No Google account connected")
 
+    acct.sync_state = "queued"
+    acct.sync_queued = True
+    acct.sync_in_progress = False
+    acct.sync_error_message = None
+    db.commit()
+
     # ✅ Send by name so the API process does NOT need to import tasks.py
     job = celery_app.send_task(
         "app.worker.tasks.sync_user",
@@ -29,6 +35,7 @@ def start_sync(
             "user_id": user_id,
             "google_account_id": acct.id,
             "lookback_days": req.lookback_days,
+            "force_reprocess": req.force_reprocess,
         },
     )
     return {"queued": True, "task_id": job.id}
@@ -55,5 +62,11 @@ def sync_status(
     return SyncStatusOut(
         last_sync_at=acct.last_sync_at,
         last_history_id=acct.last_history_id,
-        queued=False,
+        state=acct.sync_state,
+        started_at=acct.sync_started_at,
+        completed_at=acct.sync_completed_at,
+        failed_at=acct.sync_failed_at,
+        error_message=acct.sync_error_message,
+        queued=acct.sync_queued,
+        in_progress=acct.sync_in_progress,
     )

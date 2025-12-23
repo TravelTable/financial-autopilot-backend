@@ -248,17 +248,25 @@ def _gmail_get_message_with_retry(svc, message_id: str, *, format: str = "full",
 
 
 @celery_app.task(name="app.worker.tasks.sync_user", bind=True)
-def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | None = None) -> dict:
+def sync_user(
+    self,
+    user_id: int,
+    google_account_id: int,
+    lookback_days: int | None = None,
+    force_reprocess: bool = False,
+) -> dict:
     task_id = getattr(self.request, "id", None)
     logger.info(
-        "sync_user start task_id=%s user_id=%s google_account_id=%s lookback_days=%s",
+        "sync_user start task_id=%s user_id=%s google_account_id=%s lookback_days=%s force_reprocess=%s",
         task_id,
         user_id,
         google_account_id,
         lookback_days,
+        force_reprocess,
     )
 
     db = _db()
+    acct = None
     try:
         acct = (
             db.query(GoogleAccount)
@@ -267,6 +275,16 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
         )
         if not acct:
             return {"ok": False, "error": "account not found"}
+
+        now = datetime.now(timezone.utc)
+        acct.sync_state = "in_progress"
+        acct.sync_started_at = now
+        acct.sync_completed_at = None
+        acct.sync_failed_at = None
+        acct.sync_error_message = None
+        acct.sync_queued = False
+        acct.sync_in_progress = True
+        db.commit()
 
         refresh = token_cipher.decrypt(acct.refresh_token_enc)
         if lookback_days is None:
@@ -365,17 +383,23 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
 
         # -------- Process pending --------
         llm = get_llm()
-        pending = (
-            db.execute(
-                select(EmailIndex).where(
-                    EmailIndex.google_account_id == acct.id,
-                    EmailIndex.processed.is_(False),
-                )
+        tx_exists = (
+            select(Transaction.id)
+            .where(
+                Transaction.user_id == user_id,
+                Transaction.google_account_id == acct.id,
+                Transaction.gmail_message_id == EmailIndex.gmail_message_id,
             )
-            .scalars()
-            .all()
+            .exists()
         )
-        logger.info("sync_user pending emails=%s", len(pending))
+        pending_query = select(EmailIndex).where(EmailIndex.google_account_id == acct.id)
+        if force_reprocess:
+            pending_query = pending_query.where(~tx_exists)
+        else:
+            pending_query = pending_query.where(EmailIndex.processed.is_(False))
+
+        pending = db.execute(pending_query).scalars().all()
+        logger.info("sync_user pending emails=%s force_reprocess=%s", len(pending), force_reprocess)
 
         processed = 0
         tx_created = 0
@@ -588,7 +612,14 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
         else:
             logger.info("sync_user recompute_subscriptions skipped (no new tx)")
 
-        acct.last_sync_at = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
+        acct.last_sync_at = now
+        acct.sync_completed_at = now
+        acct.sync_state = "completed"
+        acct.sync_in_progress = False
+        acct.sync_queued = False
+        acct.sync_failed_at = None
+        acct.sync_error_message = None
         db.add(
             AuditLog(
                 user_id=user_id,
@@ -620,6 +651,22 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
             "processed": processed,
             "tx_created": tx_created,
         }
+    except Exception as e:
+        logger.exception(
+            "sync_user failed task_id=%s user_id=%s google_account_id=%s",
+            task_id,
+            user_id,
+            google_account_id,
+        )
+        if acct:
+            now = datetime.now(timezone.utc)
+            acct.sync_failed_at = now
+            acct.sync_state = "failed"
+            acct.sync_error_message = str(e)
+            acct.sync_in_progress = False
+            acct.sync_queued = False
+            db.commit()
+        raise
 
     finally:
         db.close()
