@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
@@ -152,14 +153,60 @@ def _is_llm_candidate(*, headers: dict, snippet: str, text: str, extracted: dict
     return False
 
 
-def _is_bulk_mail(headers: dict) -> bool:
+_NEWSLETTER_HINTS = (
+    "weekly digest",
+    "daily digest",
+    "newsletter",
+    "top stories",
+    "read online",
+    "view online",
+    "view in browser",
+    "morning roundup",
+    "this week",
+    "latest news",
+)
+
+_FINANCIAL_KEYWORDS = (
+    "receipt",
+    "invoice",
+    "payment",
+    "paid",
+    "charged",
+    "billing",
+    "bill",
+    "subscription",
+    "renewal",
+    "order confirmation",
+)
+
+_CURRENCY_REGEX = re.compile(r"[$€£¥₹]|\b(?:usd|eur|gbp|cad|aud|jpy|cny|inr|mxn|brl|chf)\b", re.I)
+_AMOUNT_REGEX = re.compile(r"\b\d{1,3}(?:[\d,]*)(?:\.\d{2})\b")
+_ORDER_ID_REGEX = re.compile(r"\b(order|transaction|invoice|receipt)\s*(?:number|no\.?|#|id)\b", re.I)
+
+
+def _has_financial_signal(subject: str, snippet: str, text: str) -> bool:
+    content = " ".join([subject or "", snippet or "", text or ""]).lower()
+    if any(keyword in content for keyword in _FINANCIAL_KEYWORDS):
+        return True
+    if _CURRENCY_REGEX.search(content) or _AMOUNT_REGEX.search(content):
+        return True
+    if _ORDER_ID_REGEX.search(content):
+        return True
+    return False
+
+
+def _is_newsletter_digest(subject: str, snippet: str, text: str) -> bool:
+    content = " ".join([subject or "", snippet or "", text or ""]).lower()
+    return any(hint in content for hint in _NEWSLETTER_HINTS)
+
+
+def _is_bulk_mail(subject: str, snippet: str, text: str) -> bool:
     """
-    Detect bulk/marketing email by common headers.
+    Only skip obvious newsletters/digests that lack financial signals.
     """
-    list_unsubscribe = headers.get("list-unsubscribe")
-    list_id = headers.get("list-id")
-    precedence = (headers.get("precedence") or "").lower()
-    return bool(list_unsubscribe or list_id) or ("bulk" in precedence or "list" in precedence)
+    if _has_financial_signal(subject, snippet, text):
+        return False
+    return _is_newsletter_digest(subject, snippet, text)
 
 
 def _subscription_has_concrete_evidence(*, amount: float | None, trial_end: date | None, renewal_date: date | None) -> bool:
@@ -242,6 +289,7 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
 
         indexed_new = 0
         skipped_existing = 0
+        skipped_bulk_newsletter = 0
         page_token = None
         page = 0
 
@@ -269,14 +317,6 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
 
                 full = _gmail_get_message_with_retry(svc, mid, format="full")
                 headers = extract_headers(full)
-                if headers.get("list-unsubscribe"):
-                    logger.info(
-                        "sync_user list-unsubscribe skipped gmail_message_id=%s subject=%s from=%s",
-                        mid,
-                        headers.get("subject"),
-                        headers.get("from"),
-                    )
-                    continue
                 payload = full.get("payload", {}) or {}
                 text_plain = get_plain_text_parts(payload) or ""
                 text_html = get_html_parts(payload) or ""
@@ -369,19 +409,7 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                 snippet = full.get("snippet", "") or ""
                 extracted = rules_extract(full, text_plain=text_plain, text_html=text_html)
 
-                if headers.get("list-unsubscribe"):
-                    logger.info(
-                        "sync_user list-unsubscribe skipped gmail_message_id=%s subject=%s from=%s",
-                        idx.gmail_message_id,
-                        headers.get("subject"),
-                        headers.get("from"),
-                    )
-                    idx.processed = True
-                    idx.processed_at = datetime.now(timezone.utc)
-                    processed += 1
-                    continue
-
-                if _is_bulk_mail(headers):
+                if _is_bulk_mail(headers.get("subject") or "", snippet, text):
                     logger.info(
                         "sync_user bulk mail skipped gmail_message_id=%s subject=%s from=%s",
                         idx.gmail_message_id,
@@ -390,6 +418,7 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                     )
                     idx.processed = True
                     idx.processed_at = datetime.now(timezone.utc)
+                    skipped_bulk_newsletter += 1
                     processed += 1
                     continue
 
@@ -546,7 +575,12 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
         # Flush any remaining batch
         db.commit()
 
-        logger.info("sync_user processing complete processed=%s tx_created=%s", processed, tx_created)
+        logger.info(
+            "sync_user processing complete processed=%s tx_created=%s skipped_bulk_newsletter=%s",
+            processed,
+            tx_created,
+            skipped_bulk_newsletter,
+        )
 
         # Only recompute if we actually created new transactions
         if tx_created > 0:
@@ -563,10 +597,19 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                     "google_account_id": acct.id,
                     "indexed_new": indexed_new,
                     "skipped_existing": skipped_existing,
+                    "skipped_bulk_newsletter": skipped_bulk_newsletter,
                     "processed": processed,
                     "tx_created": tx_created,
                 },
             )
+        )
+        logger.info(
+            "sync_user summary indexed_new=%s skipped_existing=%s skipped_bulk_newsletter=%s processed=%s tx_created=%s",
+            indexed_new,
+            skipped_existing,
+            skipped_bulk_newsletter,
+            processed,
+            tx_created,
         )
         db.commit()
 
