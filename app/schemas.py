@@ -16,12 +16,19 @@ class AuthOut(BaseModel):
 
 class SyncRequest(BaseModel):
     lookback_days: int | None = None
+    force_reprocess: bool = False
 
 
 class SyncStatusOut(BaseModel):
     last_sync_at: dt.datetime | None
     last_history_id: str | None
+    state: str | None = None
+    started_at: dt.datetime | None = None
+    completed_at: dt.datetime | None = None
+    failed_at: dt.datetime | None = None
+    error_message: str | None = None
     queued: bool = False
+    in_progress: bool = False
 
 
 class TransactionOut(BaseModel):
