@@ -472,6 +472,12 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
             # Currency: first non-null currency we see in this cluster
             currency = next((getattr(t, "currency", None) for t in cluster_items if getattr(t, "currency", None)), None)
 
+            predicted_next_renewal = (
+                next_renewal.isoformat()
+                if predicted_is_estimated and next_renewal is not None
+                else None
+            )
+
             # Store meta keys aligned to your insights endpoint/schema
             db.add(
                 Subscription(
@@ -503,7 +509,7 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
                         "cadence_variance_days": variability,
 
                         # prediction
-                        "predicted_next_renewal_date": next_renewal if predicted_is_estimated else None,
+                        "predicted_next_renewal_date": predicted_next_renewal,
                         "predicted_is_estimated": bool(predicted_is_estimated),
 
                         # explainability
