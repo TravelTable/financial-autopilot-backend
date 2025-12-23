@@ -78,7 +78,7 @@ class EmailIndex(Base):
     gmail_thread_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
     # ✅ FIX: Gmail internalDate is ms since epoch, needs BIGINT
-    internal_date_ms: Mapped[int] = mapped_column(BigInteger)
+    internal_date_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
     from_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
     subject: Mapped[str | None] = mapped_column(Text, nullable=True)
