@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from app.routers import (
     auth,
@@ -19,6 +20,7 @@ from app.routers import (
 # --- DATABASE ---
 import app.models  # noqa: F401  # ensures models are registered
 from app.config import settings
+from app.db import engine
 
 from alembic import command
 from alembic.config import Config
@@ -33,6 +35,20 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("app.main")
+
+
+def _parse_lock_id(value: str | None, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        logger.warning("Invalid MIGRATION_LOCK_ID=%r; falling back to %s", value, default)
+        return default
+
+
+MIGRATIONS_ON_STARTUP = os.getenv("MIGRATIONS_ON_STARTUP", "true").lower() in {"1", "true", "yes"}
+MIGRATION_LOCK_ID = _parse_lock_id(os.getenv("MIGRATION_LOCK_ID"), 4815162342)
 
 app = FastAPI(
     title="Financial Autopilot Backend",
@@ -54,14 +70,34 @@ async def log_requests(request: Request, call_next):
 # --- CREATE TABLES ON STARTUP ---
 @app.on_event("startup")
 def on_startup():
-    logger.info("startup: running database migrations")
-    alembic_cfg = Config(str(Path(__file__).resolve().parent.parent / "alembic.ini"))
-    alembic_cfg.set_main_option(
-        "sqlalchemy.url",
-        settings.DATABASE_URL.replace("postgresql+psycopg2", "postgresql"),
-    )
-    command.upgrade(alembic_cfg, "head")
-    logger.info("startup: migrations complete")
+    if not MIGRATIONS_ON_STARTUP:
+        logger.info("startup: migrations disabled")
+        return
+
+    with engine.connect() as connection:
+        lock_acquired = connection.execute(
+            text("SELECT pg_try_advisory_lock(:lock_id)"),
+            {"lock_id": MIGRATION_LOCK_ID},
+        ).scalar()
+
+        if not lock_acquired:
+            logger.info("startup: migrations skipped (another instance holds lock)")
+            return
+
+        try:
+            logger.info("startup: running database migrations")
+            alembic_cfg = Config(str(Path(__file__).resolve().parent.parent / "alembic.ini"))
+            alembic_cfg.set_main_option(
+                "sqlalchemy.url",
+                settings.DATABASE_URL.replace("postgresql+psycopg2", "postgresql"),
+            )
+            command.upgrade(alembic_cfg, "head")
+            logger.info("startup: migrations complete")
+        finally:
+            connection.execute(
+                text("SELECT pg_advisory_unlock(:lock_id)"),
+                {"lock_id": MIGRATION_LOCK_ID},
+            )
 
 
 # --- Core ---
