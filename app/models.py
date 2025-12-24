@@ -60,6 +60,13 @@ class GoogleAccount(Base):
 
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_history_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sync_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    sync_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    sync_completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    sync_failed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    sync_error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sync_queued: Mapped[bool] = mapped_column(Boolean, default=False)
+    sync_in_progress: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="google_accounts")
@@ -144,6 +151,7 @@ class Transaction(Base):
     renewal_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
     confidence: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    meta: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     parser_version: Mapped[str] = mapped_column(String(32), default="v1")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 

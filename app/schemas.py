@@ -16,12 +16,19 @@ class AuthOut(BaseModel):
 
 class SyncRequest(BaseModel):
     lookback_days: int | None = None
+    force_reprocess: bool = False
 
 
 class SyncStatusOut(BaseModel):
     last_sync_at: dt.datetime | None
     last_history_id: str | None
+    state: str | None = None
+    started_at: dt.datetime | None = None
+    completed_at: dt.datetime | None = None
+    failed_at: dt.datetime | None = None
+    error_message: str | None = None
     queued: bool = False
+    in_progress: bool = False
 
 
 class TransactionOut(BaseModel):
@@ -47,6 +54,14 @@ class SubscriptionOut(BaseModel):
     next_renewal_date: dt.date | None
     trial_end_date: dt.date | None
     status: str
+    next_amount: float | None = None
+    amount_is_estimated: bool = False
+    price_increased: bool = False
+    previous_amount: float | None = None
+    price_change_pct: float | None = None
+    product_name: str | None = None
+    product_id: str | None = None
+    provider: str | None = None
 
 
 class RefundDraftIn(BaseModel):

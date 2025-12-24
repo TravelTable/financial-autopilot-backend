@@ -5,6 +5,7 @@ import logging
 import re
 import time
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -19,6 +20,13 @@ from app.llm import get_llm
 from app.models import AuditLog, EmailIndex, EmailRaw, GoogleAccount, Transaction
 from app.security import token_cipher
 from app.subscriptions import recompute_subscriptions
+from app.extractors.apple_receipt import (
+    build_subscription_key,
+    estimate_confidence,
+    extract_with_llm as extract_apple_with_llm,
+    is_apple_receipt,
+    parse_apple_receipt,
+)
 from app.worker.celery_app import celery_app
 
 logger = logging.getLogger("app.worker.tasks")
@@ -90,6 +98,8 @@ def _to_float(v: Any) -> Optional[float]:
         return None
     if isinstance(v, bool):
         return None
+    if isinstance(v, Decimal):
+        return float(v)
     if isinstance(v, (int, float)):
         return float(v)
     if isinstance(v, str):
@@ -248,17 +258,25 @@ def _gmail_get_message_with_retry(svc, message_id: str, *, format: str = "full",
 
 
 @celery_app.task(name="app.worker.tasks.sync_user", bind=True)
-def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | None = None) -> dict:
+def sync_user(
+    self,
+    user_id: int,
+    google_account_id: int,
+    lookback_days: int | None = None,
+    force_reprocess: bool = False,
+) -> dict:
     task_id = getattr(self.request, "id", None)
     logger.info(
-        "sync_user start task_id=%s user_id=%s google_account_id=%s lookback_days=%s",
+        "sync_user start task_id=%s user_id=%s google_account_id=%s lookback_days=%s force_reprocess=%s",
         task_id,
         user_id,
         google_account_id,
         lookback_days,
+        force_reprocess,
     )
 
     db = _db()
+    acct = None
     try:
         acct = (
             db.query(GoogleAccount)
@@ -267,6 +285,16 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
         )
         if not acct:
             return {"ok": False, "error": "account not found"}
+
+        now = datetime.now(timezone.utc)
+        acct.sync_state = "in_progress"
+        acct.sync_started_at = now
+        acct.sync_completed_at = None
+        acct.sync_failed_at = None
+        acct.sync_error_message = None
+        acct.sync_queued = False
+        acct.sync_in_progress = True
+        db.commit()
 
         refresh = token_cipher.decrypt(acct.refresh_token_enc)
         if lookback_days is None:
@@ -365,17 +393,23 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
 
         # -------- Process pending --------
         llm = get_llm()
-        pending = (
-            db.execute(
-                select(EmailIndex).where(
-                    EmailIndex.google_account_id == acct.id,
-                    EmailIndex.processed.is_(False),
-                )
+        tx_exists = (
+            select(Transaction.id)
+            .where(
+                Transaction.user_id == user_id,
+                Transaction.google_account_id == acct.id,
+                Transaction.gmail_message_id == EmailIndex.gmail_message_id,
             )
-            .scalars()
-            .all()
+            .exists()
         )
-        logger.info("sync_user pending emails=%s", len(pending))
+        pending_query = select(EmailIndex).where(EmailIndex.google_account_id == acct.id)
+        if force_reprocess:
+            pending_query = pending_query.where(~tx_exists)
+        else:
+            pending_query = pending_query.where(EmailIndex.processed.is_(False))
+
+        pending = db.execute(pending_query).scalars().all()
+        logger.info("sync_user pending emails=%s force_reprocess=%s", len(pending), force_reprocess)
 
         processed = 0
         tx_created = 0
@@ -422,6 +456,58 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                     processed += 1
                     continue
 
+                apple_meta = None
+                if is_apple_receipt(headers.get("subject", ""), headers.get("from", ""), text_plain, text_html):
+                    logger.info("sync_user apple receipt detected gmail_message_id=%s", idx.gmail_message_id)
+                    apple_receipt = parse_apple_receipt(text_plain, text_html)
+                    apple_confidence = estimate_confidence(apple_receipt)
+                    if apple_confidence < 0.5:
+                        apple_receipt = extract_apple_with_llm(text_plain, text_html) or apple_receipt
+                        apple_confidence = estimate_confidence(apple_receipt)
+
+                    if apple_receipt:
+                        subscription_key = build_subscription_key(apple_receipt)
+                        logger.info(
+                            "sync_user apple receipt parsed gmail_message_id=%s subscription_key=%s app_name=%s "
+                            "subscription_display_name=%s amount=%s",
+                            idx.gmail_message_id,
+                            subscription_key,
+                            apple_receipt.app_name,
+                            apple_receipt.subscription_display_name,
+                            apple_receipt.amount,
+                        )
+                        extracted.update(
+                            {
+                                "vendor": "Apple App Store",
+                                "amount": apple_receipt.amount,
+                                "currency": apple_receipt.currency,
+                                "transaction_date": apple_receipt.purchase_date_utc,
+                                "category": "Subscriptions",
+                                "is_subscription": bool(
+                                    apple_receipt.subscription_display_name
+                                    or apple_receipt.raw_signals.get("subscription_terms")
+                                ),
+                            }
+                        )
+                        apple_meta = {
+                            "app_name": apple_receipt.app_name,
+                            "developer_or_seller": apple_receipt.developer_or_seller,
+                            "subscription_display_name": apple_receipt.subscription_display_name,
+                            "amount": str(apple_receipt.amount) if apple_receipt.amount is not None else None,
+                            "currency": apple_receipt.currency,
+                            "purchase_date_utc": (
+                                apple_receipt.purchase_date_utc.isoformat()
+                                if apple_receipt.purchase_date_utc
+                                else None
+                            ),
+                            "order_id": apple_receipt.order_id,
+                            "original_order_id": apple_receipt.original_order_id,
+                            "country": apple_receipt.country,
+                            "family_sharing": apple_receipt.family_sharing,
+                            "subscription_key": subscription_key,
+                            "raw_signals": apple_receipt.raw_signals,
+                        }
+
                 raw_exists = (
                     db.query(EmailRaw)
                     .filter(
@@ -453,9 +539,15 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                 llm_error = None
                 llm_classification = None
                 ai = None
+                apple_receipt_found = apple_meta is not None
 
                 # Optional LLM enrichment (gated)
-                if _is_llm_candidate(headers=headers, snippet=snippet, text=text, extracted=extracted):
+                if not apple_receipt_found and _is_llm_candidate(
+                    headers=headers,
+                    snippet=snippet,
+                    text=text,
+                    extracted=extracted,
+                ):
                     try:
                         llm_classification = _run_async(
                             llm.classify_receipt(
@@ -542,6 +634,7 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
                         trial_end_date=trial_end,
                         renewal_date=renewal_date,
                         confidence=conf_obj,
+                        meta={"apple": apple_meta} if apple_meta else None,
                     )
                 )
                 tx_created += 1
@@ -588,7 +681,14 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
         else:
             logger.info("sync_user recompute_subscriptions skipped (no new tx)")
 
-        acct.last_sync_at = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
+        acct.last_sync_at = now
+        acct.sync_completed_at = now
+        acct.sync_state = "completed"
+        acct.sync_in_progress = False
+        acct.sync_queued = False
+        acct.sync_failed_at = None
+        acct.sync_error_message = None
         db.add(
             AuditLog(
                 user_id=user_id,
@@ -620,6 +720,22 @@ def sync_user(self, user_id: int, google_account_id: int, lookback_days: int | N
             "processed": processed,
             "tx_created": tx_created,
         }
+    except Exception as e:
+        logger.exception(
+            "sync_user failed task_id=%s user_id=%s google_account_id=%s",
+            task_id,
+            user_id,
+            google_account_id,
+        )
+        if acct:
+            now = datetime.now(timezone.utc)
+            acct.sync_failed_at = now
+            acct.sync_state = "failed"
+            acct.sync_error_message = str(e)
+            acct.sync_in_progress = False
+            acct.sync_queued = False
+            db.commit()
+        raise
 
     finally:
         db.close()

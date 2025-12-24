@@ -305,12 +305,18 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
         .all()
     )
     ignored_keys: set[tuple[str, float | None, str | None]] = set()
+    ignored_subscription_keys: set[str] = set()
     for s in ignored:
+        meta = getattr(s, "meta", None)
+        if isinstance(meta, dict) and meta.get("subscription_key"):
+            ignored_subscription_keys.add(meta["subscription_key"])
+            continue
         vkey = _normalize_vendor(getattr(s, "vendor_name", "") or "")
         amt = _amount_to_float(getattr(s, "amount", None))
         ignored_keys.add((vkey, amt, getattr(s, "currency", None)))
 
     # Group transactions by normalized vendor
+    apple_groups: dict[str, list[Transaction]] = defaultdict(list)
     vendor_groups: dict[tuple[str, str | None], list[Transaction]] = defaultdict(list)
     for tx in txs:
         v = getattr(tx, "vendor", None)
@@ -318,6 +324,12 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
         if not v or not d:
             continue
         currency = getattr(tx, "currency", None)
+        meta = getattr(tx, "meta", None)
+        if isinstance(meta, dict):
+            apple_meta = meta.get("apple")
+            if isinstance(apple_meta, dict) and apple_meta.get("subscription_key"):
+                apple_groups[apple_meta["subscription_key"]].append(tx)
+                continue
         vendor_groups[(_normalize_vendor(v), currency)].append(tx)
 
     # Delete old subscriptions except ignored
@@ -329,6 +341,230 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
 
     created = 0
 
+    def _process_cluster(
+        *,
+        cluster_items: list[Transaction],
+        vendor_key: str,
+        vendor_currency: str | None,
+        display_vendor: str | None = None,
+        subscription_key: str | None = None,
+    ) -> None:
+        nonlocal created
+        if not vendor_key:
+            return
+
+        if subscription_key and subscription_key in ignored_subscription_keys:
+            return
+
+        # Determine median amount (for ignore matching + display)
+        amounts = [_amount_to_float(getattr(t, "amount", None)) for t in cluster_items]
+        amounts = [a for a in amounts if a is not None]
+        amount_median = _median(amounts)
+
+        # Skip if user previously ignored this vendor+amount
+        if not subscription_key and (vendor_key, amount_median, vendor_currency) in ignored_keys:
+            return
+
+        dates = _date_list(cluster_items)
+        if not dates:
+            return
+
+        # Flagged evidence from extraction/LLM
+        flagged = [
+            t for t in cluster_items
+            if getattr(t, "is_subscription", False)
+            or getattr(t, "trial_end_date", None)
+            or getattr(t, "renewal_date", None)
+        ]
+
+        amount_evidence = any(
+            _amount_to_float(getattr(t, "amount", None)) is not None
+            and _meets_confidence(t, "amount", _MIN_EVIDENCE_CONFIDENCE)
+            for t in cluster_items
+        )
+        trial_evidence = any(
+            getattr(t, "trial_end_date", None)
+            and _meets_confidence(t, "date", _MIN_EVIDENCE_CONFIDENCE)
+            for t in cluster_items
+        )
+        renewal_evidence = any(
+            getattr(t, "renewal_date", None)
+            and _meets_confidence(t, "date", _MIN_EVIDENCE_CONFIDENCE)
+            for t in cluster_items
+        )
+        concrete_evidence = amount_evidence or trial_evidence or renewal_evidence
+
+        # Cadence inference (if possible)
+        median_gap = _median_gap_days(dates)
+        if median_gap is not None and (median_gap < 7 or median_gap > 400):
+            # Too weird to treat as recurring
+            median_gap = None
+
+        if len(dates) == 1:
+            if not (trial_evidence or renewal_evidence):
+                return
+        elif median_gap is None:
+            if not concrete_evidence:
+                return
+
+        variability = _gap_variability_days(dates, median_gap) if median_gap else None
+        skipped_cycles = _gap_skipped_cycles(dates, median_gap) if median_gap else 0
+
+        last_date = max(dates)
+
+        # Choose next renewal:
+        # 1) explicit renewal_date (prefer latest in the future)
+        explicit_renewals = sorted(
+            {t.renewal_date for t in flagged if getattr(t, "renewal_date", None)},
+            reverse=True,
+        )
+        next_renewal = next((d for d in explicit_renewals if d >= now), None)
+
+        # 2) trial_end_date (prefer latest in the future)
+        trial_dates = sorted(
+            {t.trial_end_date for t in flagged if getattr(t, "trial_end_date", None)},
+            reverse=True,
+        )
+        trial_end = next((d for d in trial_dates if d >= now), None)
+
+        predicted_is_estimated = False
+
+        # 3) cadence prediction
+        if next_renewal is None and median_gap is not None:
+            predicted_is_estimated = True
+            next_renewal = _roll_forward(last_date + timedelta(days=median_gap), median_gap, today=now)
+
+        if next_renewal is None:
+            # If we don't have a next date, only create a sub if we have strong flagged evidence.
+            if not flagged:
+                return
+
+        # Status logic:
+        # if your enum doesn’t have trial/canceled, fall back to active but keep meta.kind.
+        status_trial = getattr(SubscriptionStatus, "trial", None)
+        status_canceled = getattr(SubscriptionStatus, "canceled", None)
+
+        if trial_end is not None and len(dates) <= 1:
+            status = status_trial or SubscriptionStatus.active
+            kind = "trial"
+        else:
+            # Active window based on cadence, fallback 60 days
+            if median_gap:
+                active_window = int(max(45, min(730, median_gap * 2)))
+            else:
+                active_window = 60
+
+            if (now - last_date).days > active_window:
+                status = status_canceled or SubscriptionStatus.active
+                kind = "inactive"
+            else:
+                status = SubscriptionStatus.active
+                kind = "active"
+
+        # Explainability
+        amount_variability = _amount_variability(amounts) if amounts else None
+        confidence, reasons = _confidence_and_reasons(
+            dates=dates,
+            median_gap=median_gap,
+            variability=variability,
+            amount_variability=amount_variability,
+            skipped_cycles=skipped_cycles,
+            flagged_count=len(flagged),
+            last_date=last_date,
+            amount_median=amount_median,
+        )
+
+        # Display vendor name: most common raw vendor string
+        display_vendor = display_vendor or _pick_display_vendor(cluster_items) or vendor_key
+
+        # Evidence transaction ids (best effort)
+        evidence_ids = [
+            getattr(t, "id", None)
+            for t in sorted(
+                cluster_items,
+                key=lambda x: getattr(x, "transaction_date", now),
+                reverse=True
+            )[:8]
+        ]
+        evidence_ids = [i for i in evidence_ids if i is not None]
+
+        # Currency: first non-null currency we see in this cluster
+        currency = next((getattr(t, "currency", None) for t in cluster_items if getattr(t, "currency", None)), None)
+
+        predicted_next_renewal = (
+            next_renewal.isoformat()
+            if predicted_is_estimated and next_renewal is not None
+            else None
+        )
+
+        # Store meta keys aligned to your insights endpoint/schema
+        db.add(
+            Subscription(
+                user_id=user_id,
+                vendor_name=display_vendor,
+                amount=amount_median,
+                currency=currency,
+                billing_cycle_days=median_gap,
+                last_charge_date=last_date,
+                next_renewal_date=next_renewal or trial_end,
+                trial_end_date=trial_end,
+                status=status,
+                meta={
+                    # provenance
+                    "source": "recompute_v2",
+                    "kind": kind,
+                    "vendor_key": vendor_key,
+                    "subscription_key": subscription_key,
+
+                    # counts
+                    "count": len(cluster_items),
+                    "flagged_count": len(flagged),
+
+                    # cadence (old + new keys)
+                    "median_gap_days": median_gap,
+                    "gap_variability_days": variability,
+                    "skipped_cycles": skipped_cycles,
+                    "amount_variability": amount_variability,
+                    "cadence_days": median_gap,
+                    "cadence_variance_days": variability,
+
+                    # prediction
+                    "predicted_next_renewal_date": predicted_next_renewal,
+                    "predicted_is_estimated": bool(predicted_is_estimated),
+
+                    # explainability
+                    "confidence": float(confidence),
+                    "reasons": reasons[:8],
+                    "evidence_tx_ids": evidence_ids,
+                },
+            )
+        )
+        created += 1
+
+    for subscription_key, items in apple_groups.items():
+        if not subscription_key:
+            continue
+        display_vendor = None
+        for tx in items:
+            meta = getattr(tx, "meta", None)
+            if isinstance(meta, dict):
+                apple_meta = meta.get("apple")
+                if isinstance(apple_meta, dict):
+                    display_vendor = (
+                        apple_meta.get("subscription_display_name")
+                        or apple_meta.get("app_name")
+                        or display_vendor
+                    )
+                    if display_vendor:
+                        break
+        _process_cluster(
+            cluster_items=items,
+            vendor_key=subscription_key,
+            vendor_currency=next((getattr(t, "currency", None) for t in items if getattr(t, "currency", None)), None),
+            display_vendor=display_vendor or "Apple Subscription",
+            subscription_key=subscription_key,
+        )
+
     for (vendor_key, vendor_currency), items in vendor_groups.items():
         if not vendor_key:
             continue
@@ -337,189 +573,11 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
         clusters = _cluster_by_amount(items)
 
         for cluster_items in clusters:
-            # Determine median amount (for ignore matching + display)
-            amounts = [_amount_to_float(getattr(t, "amount", None)) for t in cluster_items]
-            amounts = [a for a in amounts if a is not None]
-            amount_median = _median(amounts)
-
-            # Skip if user previously ignored this vendor+amount
-            if (vendor_key, amount_median, vendor_currency) in ignored_keys:
-                continue
-
-            dates = _date_list(cluster_items)
-            if not dates:
-                continue
-
-            # Flagged evidence from extraction/LLM
-            flagged = [
-                t for t in cluster_items
-                if getattr(t, "is_subscription", False)
-                or getattr(t, "trial_end_date", None)
-                or getattr(t, "renewal_date", None)
-            ]
-
-            amount_evidence = any(
-                _amount_to_float(getattr(t, "amount", None)) is not None
-                and _meets_confidence(t, "amount", _MIN_EVIDENCE_CONFIDENCE)
-                for t in cluster_items
+            _process_cluster(
+                cluster_items=cluster_items,
+                vendor_key=vendor_key,
+                vendor_currency=vendor_currency,
             )
-            trial_evidence = any(
-                getattr(t, "trial_end_date", None)
-                and _meets_confidence(t, "date", _MIN_EVIDENCE_CONFIDENCE)
-                for t in cluster_items
-            )
-            renewal_evidence = any(
-                getattr(t, "renewal_date", None)
-                and _meets_confidence(t, "date", _MIN_EVIDENCE_CONFIDENCE)
-                for t in cluster_items
-            )
-            concrete_evidence = amount_evidence or trial_evidence or renewal_evidence
-
-            # Cadence inference (if possible)
-            median_gap = _median_gap_days(dates)
-            if median_gap is not None and (median_gap < 7 or median_gap > 400):
-                # Too weird to treat as recurring
-                median_gap = None
-
-            if len(dates) == 1:
-                if not (trial_evidence or renewal_evidence):
-                    continue
-            elif median_gap is None:
-                if not concrete_evidence:
-                    continue
-
-            variability = _gap_variability_days(dates, median_gap) if median_gap else None
-            skipped_cycles = _gap_skipped_cycles(dates, median_gap) if median_gap else 0
-
-            last_date = max(dates)
-
-            # Choose next renewal:
-            # 1) explicit renewal_date (prefer latest in the future)
-            explicit_renewals = sorted(
-                {t.renewal_date for t in flagged if getattr(t, "renewal_date", None)},
-                reverse=True,
-            )
-            next_renewal = next((d for d in explicit_renewals if d >= now), None)
-
-            # 2) trial_end_date (prefer latest in the future)
-            trial_dates = sorted(
-                {t.trial_end_date for t in flagged if getattr(t, "trial_end_date", None)},
-                reverse=True,
-            )
-            trial_end = next((d for d in trial_dates if d >= now), None)
-
-            predicted_is_estimated = False
-
-            # 3) cadence prediction
-            if next_renewal is None and median_gap is not None:
-                predicted_is_estimated = True
-                next_renewal = _roll_forward(last_date + timedelta(days=median_gap), median_gap, today=now)
-
-            if next_renewal is None:
-                # If we don't have a next date, only create a sub if we have strong flagged evidence.
-                if not flagged:
-                    continue
-
-            # Status logic:
-            # if your enum doesn’t have trial/canceled, fall back to active but keep meta.kind.
-            status_trial = getattr(SubscriptionStatus, "trial", None)
-            status_canceled = getattr(SubscriptionStatus, "canceled", None)
-
-            if trial_end is not None and len(dates) <= 1:
-                status = status_trial or SubscriptionStatus.active
-                kind = "trial"
-            else:
-                # Active window based on cadence, fallback 60 days
-                if median_gap:
-                    active_window = int(max(45, min(730, median_gap * 2)))
-                else:
-                    active_window = 60
-
-                if (now - last_date).days > active_window:
-                    status = status_canceled or SubscriptionStatus.active
-                    kind = "inactive"
-                else:
-                    status = SubscriptionStatus.active
-                    kind = "active"
-
-            # Explainability
-            amount_variability = _amount_variability(amounts) if amounts else None
-            confidence, reasons = _confidence_and_reasons(
-                dates=dates,
-                median_gap=median_gap,
-                variability=variability,
-                amount_variability=amount_variability,
-                skipped_cycles=skipped_cycles,
-                flagged_count=len(flagged),
-                last_date=last_date,
-                amount_median=amount_median,
-            )
-
-            # Display vendor name: most common raw vendor string
-            display_vendor = _pick_display_vendor(cluster_items) or vendor_key
-
-            # Evidence transaction ids (best effort)
-            evidence_ids = [
-                getattr(t, "id", None)
-                for t in sorted(
-                    cluster_items,
-                    key=lambda x: getattr(x, "transaction_date", now),
-                    reverse=True
-                )[:8]
-            ]
-            evidence_ids = [i for i in evidence_ids if i is not None]
-
-            # Currency: first non-null currency we see in this cluster
-            currency = next((getattr(t, "currency", None) for t in cluster_items if getattr(t, "currency", None)), None)
-
-            predicted_next_renewal = (
-                next_renewal.isoformat()
-                if predicted_is_estimated and next_renewal is not None
-                else None
-            )
-
-            # Store meta keys aligned to your insights endpoint/schema
-            db.add(
-                Subscription(
-                    user_id=user_id,
-                    vendor_name=display_vendor,
-                    amount=amount_median,
-                    currency=currency,
-                    billing_cycle_days=median_gap,
-                    last_charge_date=last_date,
-                    next_renewal_date=next_renewal or trial_end,
-                    trial_end_date=trial_end,
-                    status=status,
-                    meta={
-                        # provenance
-                        "source": "recompute_v2",
-                        "kind": kind,
-                        "vendor_key": vendor_key,
-
-                        # counts
-                        "count": len(cluster_items),
-                        "flagged_count": len(flagged),
-
-                        # cadence (old + new keys)
-                        "median_gap_days": median_gap,
-                        "gap_variability_days": variability,
-                        "skipped_cycles": skipped_cycles,
-                        "amount_variability": amount_variability,
-                        "cadence_days": median_gap,
-                        "cadence_variance_days": variability,
-
-                        # prediction
-                        "predicted_next_renewal_date": predicted_next_renewal,
-                        "predicted_is_estimated": bool(predicted_is_estimated),
-
-                        # explainability
-                        "confidence": float(confidence),
-                        "reasons": reasons[:8],
-                        "evidence_tx_ids": evidence_ids,
-                    },
-                )
-            )
-            created += 1
 
     db.commit()
 
