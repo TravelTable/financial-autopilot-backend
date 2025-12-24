@@ -1,7 +1,9 @@
 import os
 import logging
+from pathlib import Path
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from app.routers import (
     auth,
@@ -16,9 +18,12 @@ from app.routers import (
 )
 
 # --- DATABASE ---
-from app.db import engine
-from app.models import Base
 import app.models  # noqa: F401  # ensures models are registered
+from app.db import engine
+from app.config import settings
+
+from alembic import command
+from alembic.config import Config
 
 # ---------------- Logging ----------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -51,9 +56,21 @@ async def log_requests(request: Request, call_next):
 # --- CREATE TABLES ON STARTUP ---
 @app.on_event("startup")
 def on_startup():
-    logger.info("startup: creating tables if needed")
-    Base.metadata.create_all(bind=engine)
-    logger.info("startup: tables ensured")
+    logger.info("startup: running database migrations")
+    alembic_cfg = Config(str(Path(__file__).resolve().parent.parent / "alembic.ini"))
+    alembic_cfg.set_main_option(
+        "sqlalchemy.url",
+        settings.DATABASE_URL.replace("postgresql+psycopg2", "postgresql"),
+    )
+    lock_id = 872351
+    with engine.connect() as connection:
+        connection.execute(text("SELECT pg_advisory_lock(:lock_id)"), {"lock_id": lock_id})
+        try:
+            alembic_cfg.attributes["connection"] = connection
+            command.upgrade(alembic_cfg, "head")
+        finally:
+            connection.execute(text("SELECT pg_advisory_unlock(:lock_id)"), {"lock_id": lock_id})
+    logger.info("startup: migrations complete")
 
 
 # --- Core ---

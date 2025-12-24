@@ -16,6 +16,13 @@ def run_migrations_offline():
         context.run_migrations()
 
 def run_migrations_online():
+    connection = config.attributes.get("connection")
+    if connection is not None:
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
+        return
+
     configuration = config.get_section(config.config_ini_section)
     configuration["sqlalchemy.url"] = settings.DATABASE_URL.replace("postgresql+psycopg2", "postgresql")
     connectable = engine_from_config(configuration, prefix="sqlalchemy.", poolclass=pool.NullPool)
