@@ -44,6 +44,10 @@ class TransactionOut(BaseModel):
     renewal_date: dt.date | None
 
 
+class ReanalyzeTransactionRequest(BaseModel):
+    force_llm: bool = False
+
+
 class SubscriptionOut(BaseModel):
     id: int
     vendor_name: str

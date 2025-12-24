@@ -1,11 +1,12 @@
 from __future__ import annotations
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy import select, inspect
 from app.deps import get_current_user_id
 from app.db import get_db
 from app.models import Transaction
-from app.schemas import TransactionOut
+from app.schemas import TransactionOut, ReanalyzeTransactionRequest
+from app.worker.celery_app import celery_app
 
 router = APIRouter(prefix="/transactions", tags=["transactions"])
 
@@ -55,3 +56,29 @@ def list_transactions(user_id: int = Depends(get_current_user_id), db: Session =
         )
         for t in txs
     ]
+
+
+@router.post("/{transaction_id}/reanalyze", response_model=dict)
+def reanalyze_transaction(
+    transaction_id: int,
+    req: ReanalyzeTransactionRequest,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    tx = (
+        db.query(Transaction)
+        .filter(Transaction.id == transaction_id, Transaction.user_id == user_id)
+        .first()
+    )
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    job = celery_app.send_task(
+        "app.worker.tasks.reanalyze_transaction",
+        kwargs={
+            "user_id": user_id,
+            "transaction_id": transaction_id,
+            "force_llm": req.force_llm,
+        },
+    )
+    return {"queued": True, "task_id": job.id}
