@@ -130,6 +130,95 @@ def _parse_float_maybe(v: Any) -> Optional[float]:
     return None
 
 
+def _median(values: list[float]) -> Optional[float]:
+    if not values:
+        return None
+    values = sorted(values)
+    mid = len(values) // 2
+    if len(values) % 2 == 1:
+        return values[mid]
+    return (values[mid - 1] + values[mid]) / 2.0
+
+
+def _subscription_key_from_meta(meta: dict) -> Optional[str]:
+    key = meta.get("subscription_key")
+    if isinstance(key, str) and key.strip():
+        return key.strip()
+    return None
+
+
+def _tx_matches_subscription(tx: Any, *, subscription_key: Optional[str], vendor_key: str) -> bool:
+    if subscription_key:
+        meta = getattr(tx, "meta", None)
+        if isinstance(meta, dict):
+            apple_meta = meta.get("apple")
+            if isinstance(apple_meta, dict) and apple_meta.get("subscription_key") == subscription_key:
+                return True
+    if vendor_key:
+        tx_vendor = _normalize_vendor(getattr(tx, "vendor", "") or "")
+        return tx_vendor == vendor_key
+    return False
+
+
+def _extract_product_fields(tx: Any) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    meta = getattr(tx, "meta", None)
+    if not isinstance(meta, dict):
+        return None, None, None
+    apple_meta = meta.get("apple")
+    if isinstance(apple_meta, dict):
+        product_name = (
+            apple_meta.get("subscription_display_name")
+            or apple_meta.get("app_name")
+        )
+        product_id = apple_meta.get("original_order_id") or apple_meta.get("order_id")
+        return product_name, product_id, "apple"
+    return None, None, None
+
+
+def _subscription_transactions(subscription: Subscription, txs: list[Any]) -> list[Any]:
+    meta = _get_meta(subscription)
+    subscription_key = _subscription_key_from_meta(meta)
+    vendor_key = _normalize_vendor(getattr(subscription, "vendor_name", "") or "")
+    matched = [
+        tx for tx in txs
+        if _tx_matches_subscription(tx, subscription_key=subscription_key, vendor_key=vendor_key)
+    ]
+    matched.sort(
+        key=lambda x: getattr(x, "transaction_date", None) or date.min,
+        reverse=True,
+    )
+    return matched
+
+
+def _compute_amounts(subscription: Subscription, txs: list[Any]) -> dict[str, Optional[float]]:
+    matched = _subscription_transactions(subscription, txs)
+    amounts = [
+        _safe_float(getattr(tx, "amount", None))
+        for tx in matched
+        if _safe_float(getattr(tx, "amount", None)) is not None
+    ]
+    latest_amount = amounts[0] if amounts else None
+    previous_amount = amounts[1] if len(amounts) > 1 else None
+    estimated_amount = None
+    if latest_amount is None and amounts:
+        sample = amounts[:6]
+        estimated_amount = _median(sample)
+    return {
+        "latest_amount": latest_amount,
+        "previous_amount": previous_amount,
+        "estimated_amount": estimated_amount,
+    }
+
+
+def _compute_product_fields(subscription: Subscription, txs: list[Any]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    matched = _subscription_transactions(subscription, txs)
+    for tx in matched:
+        product_name, product_id, provider = _extract_product_fields(tx)
+        if product_name or product_id or provider:
+            return product_name, product_id, provider
+    return None, None, None
+
+
 # -----------------------------
 # Existing list endpoints
 # -----------------------------
@@ -148,20 +237,60 @@ def list_subscriptions(
         )
     ).scalars().all()
 
-    return [
-        SubscriptionOut(
-            id=s.id,
-            vendor_name=s.vendor_name,
-            amount=_safe_float(s.amount),
-            currency=s.currency,
-            billing_cycle_days=s.billing_cycle_days,
-            last_charge_date=s.last_charge_date,
-            next_renewal_date=s.next_renewal_date,
-            trial_end_date=s.trial_end_date,
-            status=getattr(s.status, "value", str(s.status)),
+    txs: list[Any] = []
+    if Transaction is not None:
+        txs = (
+            db.execute(
+                select(Transaction)
+                .where(Transaction.user_id == user_id)
+                .order_by(Transaction.transaction_date.desc().nullslast())
+                .limit(500)
+            )
+            .scalars()
+            .all()
         )
-        for s in subs
-    ]
+
+    results: list[SubscriptionOut] = []
+    for s in subs:
+        amounts = _compute_amounts(s, txs)
+        latest_amount = amounts["latest_amount"]
+        previous_amount = amounts["previous_amount"]
+        estimated_amount = amounts["estimated_amount"]
+        next_amount = latest_amount or estimated_amount
+        amount_is_estimated = latest_amount is None and estimated_amount is not None
+        price_increased = (
+            latest_amount is not None
+            and previous_amount is not None
+            and latest_amount > previous_amount
+        )
+        price_change_pct = None
+        if latest_amount is not None and previous_amount not in (None, 0):
+            price_change_pct = ((latest_amount - previous_amount) / previous_amount) * 100.0
+
+        product_name, product_id, provider = _compute_product_fields(s, txs)
+
+        results.append(
+            SubscriptionOut(
+                id=s.id,
+                vendor_name=s.vendor_name,
+                amount=_safe_float(s.amount),
+                currency=s.currency,
+                billing_cycle_days=s.billing_cycle_days,
+                last_charge_date=s.last_charge_date,
+                next_renewal_date=s.next_renewal_date,
+                trial_end_date=s.trial_end_date,
+                status=getattr(s.status, "value", str(s.status)),
+                next_amount=next_amount,
+                amount_is_estimated=amount_is_estimated,
+                price_increased=price_increased,
+                previous_amount=previous_amount,
+                price_change_pct=price_change_pct,
+                product_name=product_name,
+                product_id=product_id,
+                provider=provider,
+            )
+        )
+    return results
 
 
 @router.get("/", response_model=list[SubscriptionOut])

@@ -54,6 +54,14 @@ class SubscriptionOut(BaseModel):
     next_renewal_date: dt.date | None
     trial_end_date: dt.date | None
     status: str
+    next_amount: float | None = None
+    amount_is_estimated: bool = False
+    price_increased: bool = False
+    previous_amount: float | None = None
+    price_change_pct: float | None = None
+    product_name: str | None = None
+    product_id: str | None = None
+    provider: str | None = None
 
 
 class RefundDraftIn(BaseModel):
