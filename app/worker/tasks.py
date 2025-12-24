@@ -706,11 +706,48 @@ def sync_user(
                 if not apple_receipt_found and _is_llm_candidate(
                     headers=headers,
                     snippet=snippet,
-                    text_plain=text_plain,
-                    text_html=text_html,
+                    text=text,
                     extracted=extracted,
-                    llm=llm,
-                )
+                ):
+                    try:
+                        llm_classification = _run_async(
+                            llm.classify_receipt(
+                                email_subject=headers.get("subject", ""),
+                                email_from=headers.get("from", ""),
+                                email_snippet=snippet,
+                                email_text=text,
+                                email_list_unsubscribe=headers.get("list-unsubscribe"),
+                            )
+                        )
+                        if llm_classification is not False:
+                            ai = _run_async(
+                                llm.extract_transaction(
+                                    email_subject=headers.get("subject", ""),
+                                    email_from=headers.get("from", ""),
+                                    email_snippet=snippet,
+                                    email_text=text,
+                                    email_list_unsubscribe=headers.get("list-unsubscribe"),
+                                )
+                            )
+                            llm_used = True
+                        else:
+                            ai = None
+                        if isinstance(ai, dict):
+                            for k in [
+                                "vendor",
+                                "amount",
+                                "currency",
+                                "transaction_date",
+                                "category",
+                                "is_subscription",
+                                "trial_end_date",
+                                "renewal_date",
+                                "confidence",
+                            ]:
+                                if ai.get(k) not in (None, "", {}):
+                                    extracted[k] = ai[k]
+                    except Exception as e:
+                        llm_error = str(e)
                 if llm_error:
                     db.add(
                         AuditLog(
