@@ -607,6 +607,67 @@ def sync_user(
                     processed += 1
                     continue
 
+                apple_meta = None
+                billing_provider = None
+                if is_apple_receipt(headers.get("subject", ""), headers.get("from", ""), text_plain, text_html):
+                    logger.info("sync_user apple receipt detected gmail_message_id=%s", idx.gmail_message_id)
+                    apple_receipt = parse_apple_receipt(text_plain, text_html)
+                    apple_confidence = estimate_confidence(apple_receipt)
+                    if apple_confidence < 0.5:
+                        apple_receipt = extract_apple_with_llm(text_plain, text_html) or apple_receipt
+                        apple_confidence = estimate_confidence(apple_receipt)
+                    if apple_receipt and not apple_receipt.subscription_display_name and not apple_receipt.app_name:
+                        apple_receipt = extract_apple_with_llm(text_plain, text_html) or apple_receipt
+                        apple_confidence = estimate_confidence(apple_receipt)
+
+                    if apple_receipt:
+                        subscription_key = build_subscription_key(apple_receipt)
+                        subscription_name = (
+                            apple_receipt.subscription_display_name
+                            or apple_receipt.app_name
+                        )
+                        logger.info(
+                            "sync_user apple receipt parsed gmail_message_id=%s subscription_key=%s app_name=%s "
+                            "subscription_display_name=%s amount=%s",
+                            idx.gmail_message_id,
+                            subscription_key,
+                            apple_receipt.app_name,
+                            apple_receipt.subscription_display_name,
+                            apple_receipt.amount,
+                        )
+                        extracted.update(
+                            {
+                                "vendor": subscription_name or "Apple App Store",
+                                "amount": apple_receipt.amount,
+                                "currency": apple_receipt.currency,
+                                "transaction_date": apple_receipt.purchase_date_utc,
+                                "category": "Subscriptions",
+                                "is_subscription": bool(
+                                    apple_receipt.subscription_display_name
+                                    or apple_receipt.raw_signals.get("subscription_terms")
+                                ),
+                            }
+                        )
+                        billing_provider = "Apple App Store"
+                        apple_meta = {
+                            "app_name": apple_receipt.app_name,
+                            "developer_or_seller": apple_receipt.developer_or_seller,
+                            "subscription_display_name": apple_receipt.subscription_display_name,
+                            "amount": str(apple_receipt.amount) if apple_receipt.amount is not None else None,
+                            "currency": apple_receipt.currency,
+                            "purchase_date_utc": (
+                                apple_receipt.purchase_date_utc.isoformat()
+                                if apple_receipt.purchase_date_utc
+                                else None
+                            ),
+                            "order_id": apple_receipt.order_id,
+                            "original_order_id": apple_receipt.original_order_id,
+                            "country": apple_receipt.country,
+                            "family_sharing": apple_receipt.family_sharing,
+                            "subscription_key": subscription_key,
+                            "raw_signals": apple_receipt.raw_signals,
+                        }
+
                 raw_exists = (
                     db.query(EmailRaw)
                     .filter(
@@ -634,7 +695,15 @@ def sync_user(
                         )
                     )
 
-                extracted, meta, llm_used, llm_error, llm_classification = _enrich_extraction(
+                llm_used = False
+                llm_error = None
+                llm_classification = None
+                ai = None
+                apple_receipt_found = apple_meta is not None
+                raw_vendor = extracted.get("vendor")
+
+                # Optional LLM enrichment (gated)
+                if not apple_receipt_found and _is_llm_candidate(
                     headers=headers,
                     snippet=snippet,
                     text_plain=text_plain,
@@ -663,6 +732,10 @@ def sync_user(
                     amount=amount, trial_end=trial_end, renewal_date=renewal_date
                 ):
                     is_subscription = False
+                if not billing_provider and raw_vendor and vendor and raw_vendor != vendor:
+                    if _is_generic_billing_provider(raw_vendor):
+                        billing_provider = raw_vendor
+
                 # Store confidence as JSON, and record provenance (rules vs llm)
                 conf_obj = extracted.get("confidence")
                 if conf_obj is None or not isinstance(conf_obj, dict):
@@ -675,6 +748,14 @@ def sync_user(
                     conf_obj["llm_classification"] = "not_receipt"
                 if extracted.get("is_subscription") and not is_subscription:
                     conf_obj["subscription_downgraded"] = "missing_amount_or_dates"
+
+                meta: dict[str, Any] | None = None
+                if apple_meta or billing_provider:
+                    meta = {}
+                    if apple_meta:
+                        meta["apple"] = apple_meta
+                    if billing_provider:
+                        meta["billing_provider"] = billing_provider
 
                 db.add(
                     Transaction(
