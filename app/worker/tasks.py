@@ -132,6 +132,27 @@ _SUBJECT_HINTS = (
     "active subscription",
 )
 
+_GENERIC_BILLING_PROVIDERS = {
+    "apple",
+    "apple app store",
+    "apple subscription",
+    "app store",
+    "itunes",
+    "google",
+    "google play",
+    "amazon",
+    "amazon pay",
+    "paypal",
+    "stripe",
+    "microsoft",
+}
+
+
+def _is_generic_billing_provider(vendor: str | None) -> bool:
+    if not vendor:
+        return False
+    return vendor.strip().lower() in _GENERIC_BILLING_PROVIDERS
+
 
 def _is_llm_candidate(*, headers: dict, snippet: str, text: str, extracted: dict) -> bool:
     """
@@ -158,6 +179,8 @@ def _is_llm_candidate(*, headers: dict, snippet: str, text: str, extracted: dict
     missing_amount = extracted.get("amount") in (None, "")
     missing_date = not extracted.get("transaction_date")
     if (missing_vendor or missing_amount or missing_date) and len(text) > 200:
+        return True
+    if _is_generic_billing_provider(extracted.get("vendor")) and len(text) > 200:
         return True
 
     return False
@@ -457,6 +480,7 @@ def sync_user(
                     continue
 
                 apple_meta = None
+                billing_provider = None
                 if is_apple_receipt(headers.get("subject", ""), headers.get("from", ""), text_plain, text_html):
                     logger.info("sync_user apple receipt detected gmail_message_id=%s", idx.gmail_message_id)
                     apple_receipt = parse_apple_receipt(text_plain, text_html)
@@ -464,9 +488,16 @@ def sync_user(
                     if apple_confidence < 0.5:
                         apple_receipt = extract_apple_with_llm(text_plain, text_html) or apple_receipt
                         apple_confidence = estimate_confidence(apple_receipt)
+                    if apple_receipt and not apple_receipt.subscription_display_name and not apple_receipt.app_name:
+                        apple_receipt = extract_apple_with_llm(text_plain, text_html) or apple_receipt
+                        apple_confidence = estimate_confidence(apple_receipt)
 
                     if apple_receipt:
                         subscription_key = build_subscription_key(apple_receipt)
+                        subscription_name = (
+                            apple_receipt.subscription_display_name
+                            or apple_receipt.app_name
+                        )
                         logger.info(
                             "sync_user apple receipt parsed gmail_message_id=%s subscription_key=%s app_name=%s "
                             "subscription_display_name=%s amount=%s",
@@ -478,7 +509,7 @@ def sync_user(
                         )
                         extracted.update(
                             {
-                                "vendor": "Apple App Store",
+                                "vendor": subscription_name or "Apple App Store",
                                 "amount": apple_receipt.amount,
                                 "currency": apple_receipt.currency,
                                 "transaction_date": apple_receipt.purchase_date_utc,
@@ -489,6 +520,7 @@ def sync_user(
                                 ),
                             }
                         )
+                        billing_provider = "Apple App Store"
                         apple_meta = {
                             "app_name": apple_receipt.app_name,
                             "developer_or_seller": apple_receipt.developer_or_seller,
@@ -540,6 +572,7 @@ def sync_user(
                 llm_classification = None
                 ai = None
                 apple_receipt_found = apple_meta is not None
+                raw_vendor = extracted.get("vendor")
 
                 # Optional LLM enrichment (gated)
                 if not apple_receipt_found and _is_llm_candidate(
@@ -606,6 +639,9 @@ def sync_user(
                     amount=amount, trial_end=trial_end, renewal_date=renewal_date
                 ):
                     is_subscription = False
+                if not billing_provider and raw_vendor and vendor and raw_vendor != vendor:
+                    if _is_generic_billing_provider(raw_vendor):
+                        billing_provider = raw_vendor
 
                 # Store confidence as JSON, and record provenance (rules vs llm)
                 conf_obj = extracted.get("confidence")
@@ -619,6 +655,14 @@ def sync_user(
                     conf_obj["llm_classification"] = "not_receipt"
                 if extracted.get("is_subscription") and not is_subscription:
                     conf_obj["subscription_downgraded"] = "missing_amount_or_dates"
+
+                meta: dict[str, Any] | None = None
+                if apple_meta or billing_provider:
+                    meta = {}
+                    if apple_meta:
+                        meta["apple"] = apple_meta
+                    if billing_provider:
+                        meta["billing_provider"] = billing_provider
 
                 db.add(
                     Transaction(
@@ -634,7 +678,7 @@ def sync_user(
                         trial_end_date=trial_end,
                         renewal_date=renewal_date,
                         confidence=conf_obj,
-                        meta={"apple": apple_meta} if apple_meta else None,
+                        meta=meta,
                     )
                 )
                 tx_created += 1
