@@ -4,8 +4,8 @@ from datetime import date
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import select, inspect
+from sqlalchemy.orm import Session, load_only
 
 from app.deps import get_current_user_id
 from app.db import get_db
@@ -26,6 +26,13 @@ router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
 # -----------------------------
 # Helpers
 # -----------------------------
+
+def _transactions_meta_available(db: Session) -> bool:
+    try:
+        columns = {col["name"] for col in inspect(db.get_bind()).get_columns("transactions")}
+        return "meta" in columns
+    except Exception:
+        return False
 
 def _normalize_vendor(s: str) -> str:
     """
@@ -147,8 +154,14 @@ def _subscription_key_from_meta(meta: dict) -> Optional[str]:
     return None
 
 
-def _tx_matches_subscription(tx: Any, *, subscription_key: Optional[str], vendor_key: str) -> bool:
-    if subscription_key:
+def _tx_matches_subscription(
+    tx: Any,
+    *,
+    subscription_key: Optional[str],
+    vendor_key: str,
+    meta_available: bool,
+) -> bool:
+    if subscription_key and meta_available:
         meta = getattr(tx, "meta", None)
         if isinstance(meta, dict):
             apple_meta = meta.get("apple")
@@ -160,7 +173,13 @@ def _tx_matches_subscription(tx: Any, *, subscription_key: Optional[str], vendor
     return False
 
 
-def _extract_product_fields(tx: Any) -> tuple[Optional[str], Optional[str], Optional[str]]:
+def _extract_product_fields(
+    tx: Any,
+    *,
+    meta_available: bool,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    if not meta_available:
+        return None, None, None
     meta = getattr(tx, "meta", None)
     if not isinstance(meta, dict):
         return None, None, None
@@ -175,13 +194,23 @@ def _extract_product_fields(tx: Any) -> tuple[Optional[str], Optional[str], Opti
     return None, None, None
 
 
-def _subscription_transactions(subscription: Subscription, txs: list[Any]) -> list[Any]:
+def _subscription_transactions(
+    subscription: Subscription,
+    txs: list[Any],
+    *,
+    meta_available: bool,
+) -> list[Any]:
     meta = _get_meta(subscription)
     subscription_key = _subscription_key_from_meta(meta)
     vendor_key = _normalize_vendor(getattr(subscription, "vendor_name", "") or "")
     matched = [
         tx for tx in txs
-        if _tx_matches_subscription(tx, subscription_key=subscription_key, vendor_key=vendor_key)
+        if _tx_matches_subscription(
+            tx,
+            subscription_key=subscription_key,
+            vendor_key=vendor_key,
+            meta_available=meta_available,
+        )
     ]
     matched.sort(
         key=lambda x: getattr(x, "transaction_date", None) or date.min,
@@ -190,8 +219,13 @@ def _subscription_transactions(subscription: Subscription, txs: list[Any]) -> li
     return matched
 
 
-def _compute_amounts(subscription: Subscription, txs: list[Any]) -> dict[str, Optional[float]]:
-    matched = _subscription_transactions(subscription, txs)
+def _compute_amounts(
+    subscription: Subscription,
+    txs: list[Any],
+    *,
+    meta_available: bool,
+) -> dict[str, Optional[float]]:
+    matched = _subscription_transactions(subscription, txs, meta_available=meta_available)
     amounts = [
         _safe_float(getattr(tx, "amount", None))
         for tx in matched
@@ -210,10 +244,15 @@ def _compute_amounts(subscription: Subscription, txs: list[Any]) -> dict[str, Op
     }
 
 
-def _compute_product_fields(subscription: Subscription, txs: list[Any]) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    matched = _subscription_transactions(subscription, txs)
+def _compute_product_fields(
+    subscription: Subscription,
+    txs: list[Any],
+    *,
+    meta_available: bool,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    matched = _subscription_transactions(subscription, txs, meta_available=meta_available)
     for tx in matched:
-        product_name, product_id, provider = _extract_product_fields(tx)
+        product_name, product_id, provider = _extract_product_fields(tx, meta_available=meta_available)
         if product_name or product_id or provider:
             return product_name, product_id, provider
     return None, None, None
@@ -238,21 +277,35 @@ def list_subscriptions(
     ).scalars().all()
 
     txs: list[Any] = []
+    meta_available = False
     if Transaction is not None:
-        txs = (
-            db.execute(
-                select(Transaction)
-                .where(Transaction.user_id == user_id)
-                .order_by(Transaction.transaction_date.desc().nullslast())
-                .limit(500)
-            )
-            .scalars()
-            .all()
+        meta_available = _transactions_meta_available(db)
+        tx_query = (
+            select(Transaction)
+            .where(Transaction.user_id == user_id)
+            .order_by(Transaction.transaction_date.desc().nullslast())
+            .limit(500)
         )
+        if not meta_available:
+            tx_query = tx_query.options(
+                load_only(
+                    Transaction.id,
+                    Transaction.user_id,
+                    Transaction.vendor,
+                    Transaction.amount,
+                    Transaction.currency,
+                    Transaction.transaction_date,
+                    Transaction.category,
+                    Transaction.is_subscription,
+                    Transaction.trial_end_date,
+                    Transaction.renewal_date,
+                )
+            )
+        txs = db.execute(tx_query).scalars().all()
 
     results: list[SubscriptionOut] = []
     for s in subs:
-        amounts = _compute_amounts(s, txs)
+        amounts = _compute_amounts(s, txs, meta_available=meta_available)
         latest_amount = amounts["latest_amount"]
         previous_amount = amounts["previous_amount"]
         estimated_amount = amounts["estimated_amount"]
@@ -267,7 +320,11 @@ def list_subscriptions(
         if latest_amount is not None and previous_amount not in (None, 0):
             price_change_pct = ((latest_amount - previous_amount) / previous_amount) * 100.0
 
-        product_name, product_id, provider = _compute_product_fields(s, txs)
+        product_name, product_id, provider = _compute_product_fields(
+            s,
+            txs,
+            meta_available=meta_available,
+        )
 
         results.append(
             SubscriptionOut(
