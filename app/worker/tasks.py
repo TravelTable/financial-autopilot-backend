@@ -132,6 +132,27 @@ _SUBJECT_HINTS = (
     "active subscription",
 )
 
+_GENERIC_BILLING_PROVIDERS = {
+    "apple",
+    "apple app store",
+    "apple subscription",
+    "app store",
+    "itunes",
+    "google",
+    "google play",
+    "amazon",
+    "amazon pay",
+    "paypal",
+    "stripe",
+    "microsoft",
+}
+
+
+def _is_generic_billing_provider(vendor: str | None) -> bool:
+    if not vendor:
+        return False
+    return vendor.strip().lower() in _GENERIC_BILLING_PROVIDERS
+
 
 def _is_llm_candidate(*, headers: dict, snippet: str, text: str, extracted: dict) -> bool:
     """
@@ -158,6 +179,8 @@ def _is_llm_candidate(*, headers: dict, snippet: str, text: str, extracted: dict
     missing_amount = extracted.get("amount") in (None, "")
     missing_date = not extracted.get("transaction_date")
     if (missing_vendor or missing_amount or missing_date) and len(text) > 200:
+        return True
+    if _is_generic_billing_provider(extracted.get("vendor")) and len(text) > 200:
         return True
 
     return False
@@ -222,6 +245,134 @@ def _is_bulk_mail(subject: str, snippet: str, text: str) -> bool:
 def _subscription_has_concrete_evidence(*, amount: float | None, trial_end: date | None, renewal_date: date | None) -> bool:
     return bool(amount is not None or trial_end or renewal_date)
 
+
+def _enrich_extraction(
+    *,
+    headers: dict,
+    snippet: str,
+    text_plain: str,
+    text_html: str,
+    extracted: dict,
+    llm,
+    force_llm: bool = False,
+) -> tuple[dict, dict | None, bool, str | None, bool | None]:
+    apple_meta = None
+    billing_provider = None
+    llm_used = False
+    llm_error = None
+    llm_classification = None
+    apple_receipt_found = False
+    text = text_plain or text_html or ""
+
+    if is_apple_receipt(headers.get("subject", ""), headers.get("from", ""), text_plain, text_html):
+        apple_receipt_found = True
+        logger.info("sync_user apple receipt detected")
+        apple_receipt = parse_apple_receipt(text_plain, text_html)
+        apple_confidence = estimate_confidence(apple_receipt)
+        if apple_confidence < 0.5:
+            apple_receipt = extract_apple_with_llm(text_plain, text_html) or apple_receipt
+            apple_confidence = estimate_confidence(apple_receipt)
+        if apple_receipt and not apple_receipt.subscription_display_name and not apple_receipt.app_name:
+            apple_receipt = extract_apple_with_llm(text_plain, text_html) or apple_receipt
+            apple_confidence = estimate_confidence(apple_receipt)
+
+        if apple_receipt:
+            subscription_key = build_subscription_key(apple_receipt)
+            subscription_name = apple_receipt.subscription_display_name or apple_receipt.app_name
+            extracted.update(
+                {
+                    "vendor": subscription_name or "Apple App Store",
+                    "amount": apple_receipt.amount,
+                    "currency": apple_receipt.currency,
+                    "transaction_date": apple_receipt.purchase_date_utc,
+                    "category": "Subscriptions",
+                    "is_subscription": bool(
+                        apple_receipt.subscription_display_name
+                        or apple_receipt.raw_signals.get("subscription_terms")
+                    ),
+                }
+            )
+            billing_provider = "Apple App Store"
+            apple_meta = {
+                "app_name": apple_receipt.app_name,
+                "developer_or_seller": apple_receipt.developer_or_seller,
+                "subscription_display_name": apple_receipt.subscription_display_name,
+                "amount": str(apple_receipt.amount) if apple_receipt.amount is not None else None,
+                "currency": apple_receipt.currency,
+                "purchase_date_utc": (
+                    apple_receipt.purchase_date_utc.isoformat()
+                    if apple_receipt.purchase_date_utc
+                    else None
+                ),
+                "order_id": apple_receipt.order_id,
+                "original_order_id": apple_receipt.original_order_id,
+                "country": apple_receipt.country,
+                "family_sharing": apple_receipt.family_sharing,
+                "subscription_key": subscription_key,
+                "raw_signals": apple_receipt.raw_signals,
+            }
+
+    raw_vendor = extracted.get("vendor")
+    if text and (force_llm or (not apple_receipt_found and _is_llm_candidate(
+        headers=headers,
+        snippet=snippet,
+        text=text,
+        extracted=extracted,
+    ))):
+        try:
+            llm_classification = _run_async(
+                llm.classify_receipt(
+                    email_subject=headers.get("subject", ""),
+                    email_from=headers.get("from", ""),
+                    email_snippet=snippet,
+                    email_text=text,
+                    email_list_unsubscribe=headers.get("list-unsubscribe"),
+                )
+            )
+            if llm_classification is not False:
+                ai = _run_async(
+                    llm.extract_transaction(
+                        email_subject=headers.get("subject", ""),
+                        email_from=headers.get("from", ""),
+                        email_snippet=snippet,
+                        email_text=text,
+                        email_list_unsubscribe=headers.get("list-unsubscribe"),
+                    )
+                )
+                llm_used = True
+            else:
+                ai = None
+            if isinstance(ai, dict):
+                for k in [
+                    "vendor",
+                    "amount",
+                    "currency",
+                    "transaction_date",
+                    "category",
+                    "is_subscription",
+                    "trial_end_date",
+                    "renewal_date",
+                    "confidence",
+                ]:
+                    if ai.get(k) not in (None, "", {}):
+                        extracted[k] = ai[k]
+        except Exception as e:
+            llm_error = str(e)
+
+    vendor = extracted.get("vendor")
+    if not billing_provider and raw_vendor and vendor and raw_vendor != vendor:
+        if _is_generic_billing_provider(raw_vendor):
+            billing_provider = raw_vendor
+
+    meta: dict[str, Any] | None = None
+    if apple_meta or billing_provider:
+        meta = {}
+        if apple_meta:
+            meta["apple"] = apple_meta
+        if billing_provider:
+            meta["billing_provider"] = billing_provider
+
+    return extracted, meta, llm_used, llm_error, llm_classification
 
 def _run_async(coro):
     """
@@ -456,58 +607,6 @@ def sync_user(
                     processed += 1
                     continue
 
-                apple_meta = None
-                if is_apple_receipt(headers.get("subject", ""), headers.get("from", ""), text_plain, text_html):
-                    logger.info("sync_user apple receipt detected gmail_message_id=%s", idx.gmail_message_id)
-                    apple_receipt = parse_apple_receipt(text_plain, text_html)
-                    apple_confidence = estimate_confidence(apple_receipt)
-                    if apple_confidence < 0.5:
-                        apple_receipt = extract_apple_with_llm(text_plain, text_html) or apple_receipt
-                        apple_confidence = estimate_confidence(apple_receipt)
-
-                    if apple_receipt:
-                        subscription_key = build_subscription_key(apple_receipt)
-                        logger.info(
-                            "sync_user apple receipt parsed gmail_message_id=%s subscription_key=%s app_name=%s "
-                            "subscription_display_name=%s amount=%s",
-                            idx.gmail_message_id,
-                            subscription_key,
-                            apple_receipt.app_name,
-                            apple_receipt.subscription_display_name,
-                            apple_receipt.amount,
-                        )
-                        extracted.update(
-                            {
-                                "vendor": "Apple App Store",
-                                "amount": apple_receipt.amount,
-                                "currency": apple_receipt.currency,
-                                "transaction_date": apple_receipt.purchase_date_utc,
-                                "category": "Subscriptions",
-                                "is_subscription": bool(
-                                    apple_receipt.subscription_display_name
-                                    or apple_receipt.raw_signals.get("subscription_terms")
-                                ),
-                            }
-                        )
-                        apple_meta = {
-                            "app_name": apple_receipt.app_name,
-                            "developer_or_seller": apple_receipt.developer_or_seller,
-                            "subscription_display_name": apple_receipt.subscription_display_name,
-                            "amount": str(apple_receipt.amount) if apple_receipt.amount is not None else None,
-                            "currency": apple_receipt.currency,
-                            "purchase_date_utc": (
-                                apple_receipt.purchase_date_utc.isoformat()
-                                if apple_receipt.purchase_date_utc
-                                else None
-                            ),
-                            "order_id": apple_receipt.order_id,
-                            "original_order_id": apple_receipt.original_order_id,
-                            "country": apple_receipt.country,
-                            "family_sharing": apple_receipt.family_sharing,
-                            "subscription_key": subscription_key,
-                            "raw_signals": apple_receipt.raw_signals,
-                        }
-
                 raw_exists = (
                     db.query(EmailRaw)
                     .filter(
@@ -535,64 +634,22 @@ def sync_user(
                         )
                     )
 
-                llm_used = False
-                llm_error = None
-                llm_classification = None
-                ai = None
-                apple_receipt_found = apple_meta is not None
-
-                # Optional LLM enrichment (gated)
-                if not apple_receipt_found and _is_llm_candidate(
+                extracted, meta, llm_used, llm_error, llm_classification = _enrich_extraction(
                     headers=headers,
                     snippet=snippet,
-                    text=text,
+                    text_plain=text_plain,
+                    text_html=text_html,
                     extracted=extracted,
-                ):
-                    try:
-                        llm_classification = _run_async(
-                            llm.classify_receipt(
-                                email_subject=headers.get("subject", ""),
-                                email_from=headers.get("from", ""),
-                                email_snippet=snippet,
-                                email_text=text,
-                                email_list_unsubscribe=headers.get("list-unsubscribe"),
-                            )
+                    llm=llm,
+                )
+                if llm_error:
+                    db.add(
+                        AuditLog(
+                            user_id=user_id,
+                            action="llm_extract_error",
+                            meta={"gmail_message_id": idx.gmail_message_id, "error": llm_error},
                         )
-                        if llm_classification is not False:
-                            ai = _run_async(
-                                llm.extract_transaction(
-                                    email_subject=headers.get("subject", ""),
-                                    email_from=headers.get("from", ""),
-                                    email_snippet=snippet,
-                                    email_text=text,
-                                    email_list_unsubscribe=headers.get("list-unsubscribe"),
-                                )
-                            )
-                            llm_used = True
-                        if isinstance(ai, dict):
-                            # Only overwrite if AI provides a meaningful value
-                            for k in [
-                                "vendor",
-                                "amount",
-                                "currency",
-                                "transaction_date",
-                                "category",
-                                "is_subscription",
-                                "trial_end_date",
-                                "renewal_date",
-                                "confidence",
-                            ]:
-                                if ai.get(k) not in (None, "", {}):
-                                    extracted[k] = ai[k]
-                    except Exception as e:
-                        llm_error = str(e)
-                        db.add(
-                            AuditLog(
-                                user_id=user_id,
-                                action="llm_extract_error",
-                                meta={"gmail_message_id": idx.gmail_message_id, "error": llm_error},
-                            )
-                        )
+                    )
 
                 # Normalize types before insert
                 vendor = extracted.get("vendor")
@@ -606,7 +663,6 @@ def sync_user(
                     amount=amount, trial_end=trial_end, renewal_date=renewal_date
                 ):
                     is_subscription = False
-
                 # Store confidence as JSON, and record provenance (rules vs llm)
                 conf_obj = extracted.get("confidence")
                 if conf_obj is None or not isinstance(conf_obj, dict):
@@ -634,7 +690,7 @@ def sync_user(
                         trial_end_date=trial_end,
                         renewal_date=renewal_date,
                         confidence=conf_obj,
-                        meta={"apple": apple_meta} if apple_meta else None,
+                        meta=meta,
                     )
                 )
                 tx_created += 1
@@ -749,5 +805,111 @@ def run_alert_scheduler() -> dict:
         db.add(AuditLog(user_id=None, action="alerts_scheduled", meta={"count": n}))
         db.commit()
         return {"ok": True, "scheduled": n}
+    finally:
+        db.close()
+
+
+@celery_app.task(name="app.worker.tasks.reanalyze_transaction", bind=True)
+def reanalyze_transaction(
+    self,
+    user_id: int,
+    transaction_id: int,
+    force_llm: bool = False,
+) -> dict:
+    db = _db()
+    try:
+        tx = (
+            db.query(Transaction)
+            .filter(Transaction.id == transaction_id, Transaction.user_id == user_id)
+            .first()
+        )
+        if not tx:
+            return {"ok": False, "error": "transaction not found"}
+
+        raw = (
+            db.query(EmailRaw)
+            .filter(
+                EmailRaw.google_account_id == tx.google_account_id,
+                EmailRaw.gmail_message_id == tx.gmail_message_id,
+            )
+            .first()
+        )
+        if not raw:
+            return {"ok": False, "error": "email payload not found"}
+
+        message = {
+            "payload": {"headers": raw.headers_json or []},
+            "snippet": raw.snippet or "",
+            "internalDate": str(raw.internal_date_ms or 0),
+        }
+        headers = extract_headers(message)
+        extracted = rules_extract(message, text_plain=raw.text_plain or "", text_html=raw.text_html or "")
+        llm = get_llm()
+        extracted, meta, llm_used, llm_error, llm_classification = _enrich_extraction(
+            headers=headers,
+            snippet=raw.snippet or "",
+            text_plain=raw.text_plain or "",
+            text_html=raw.text_html or "",
+            extracted=extracted,
+            llm=llm,
+            force_llm=force_llm,
+        )
+
+        vendor = extracted.get("vendor") or tx.vendor
+        currency = extracted.get("currency") or tx.currency
+        amount = _to_float(extracted.get("amount"))
+        tx_date = _to_date(extracted.get("transaction_date"))
+        trial_end = _to_date(extracted.get("trial_end_date"))
+        renewal_date = _to_date(extracted.get("renewal_date"))
+        if amount is None:
+            amount = tx.amount
+        if tx_date is None:
+            tx_date = tx.transaction_date
+
+        is_subscription = bool(extracted.get("is_subscription", False))
+        if is_subscription and not _subscription_has_concrete_evidence(
+            amount=amount, trial_end=trial_end, renewal_date=renewal_date
+        ):
+            is_subscription = False
+
+        conf_obj = extracted.get("confidence")
+        if conf_obj is None or not isinstance(conf_obj, dict):
+            conf_obj = {}
+
+        conf_obj.setdefault("source", "llm+rules" if llm_used else "rules")
+        if llm_error:
+            conf_obj["llm_error"] = llm_error
+        if llm_classification is False:
+            conf_obj["llm_classification"] = "not_receipt"
+        if extracted.get("is_subscription") and not is_subscription:
+            conf_obj["subscription_downgraded"] = "missing_amount_or_dates"
+
+        tx.vendor = vendor
+        tx.amount = amount
+        tx.currency = currency
+        tx.transaction_date = tx_date
+        tx.category = extracted.get("category") or tx.category
+        tx.is_subscription = is_subscription
+        tx.trial_end_date = trial_end
+        tx.renewal_date = renewal_date
+        tx.confidence = conf_obj
+        tx.meta = meta or tx.meta
+
+        db.add(
+            AuditLog(
+                user_id=user_id,
+                action="transaction_reanalyzed",
+                meta={
+                    "transaction_id": tx.id,
+                    "force_llm": force_llm,
+                },
+            )
+        )
+        db.commit()
+
+        recompute_subscriptions(db, user_id=user_id)
+        db.commit()
+
+        return {"ok": True, "transaction_id": tx.id}
     finally:
         db.close()

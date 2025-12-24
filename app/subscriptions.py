@@ -20,6 +20,21 @@ _NOISE_TOKENS = {
 
 _SEPARATORS = ["•", "·", "|", "/", "\\", ",", ";", "—", "-", "_", ":", "(", ")", "[", "]", "{", "}", "*"]
 
+_GENERIC_BILLING_PROVIDERS = {
+    "apple",
+    "apple app store",
+    "apple subscription",
+    "app store",
+    "itunes",
+    "google",
+    "google play",
+    "amazon",
+    "amazon pay",
+    "paypal",
+    "stripe",
+    "microsoft",
+}
+
 
 def _normalize_vendor(v: str) -> str:
     """
@@ -66,6 +81,12 @@ def _median(nums: list[float]) -> float | None:
 
 
 _MIN_EVIDENCE_CONFIDENCE = 0.5
+
+
+def _is_generic_billing_provider(vendor: str | None) -> bool:
+    if not vendor:
+        return False
+    return vendor.strip().lower() in _GENERIC_BILLING_PROVIDERS
 
 
 def _meets_confidence(tx: Transaction, key: str, minimum: float | None) -> bool:
@@ -407,10 +428,23 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
             if not concrete_evidence:
                 return
 
+        if amount_median is None:
+            if trial_evidence:
+                amount_median = 0.0
+            else:
+                return
+
         variability = _gap_variability_days(dates, median_gap) if median_gap else None
         skipped_cycles = _gap_skipped_cycles(dates, median_gap) if median_gap else 0
 
         last_date = max(dates)
+
+        amount_variability = _amount_variability(amounts) if amounts else None
+        if not flagged and not subscription_key:
+            if len(dates) < 3 or median_gap is None:
+                return
+            if amount_variability is None or amount_variability > max(0.5, amount_median * 0.05):
+                return
 
         # Choose next renewal:
         # 1) explicit renewal_date (prefer latest in the future)
@@ -462,7 +496,6 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
                 kind = "active"
 
         # Explainability
-        amount_variability = _amount_variability(amounts) if amounts else None
         confidence, reasons = _confidence_and_reasons(
             dates=dates,
             median_gap=median_gap,
@@ -476,6 +509,8 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
 
         # Display vendor name: most common raw vendor string
         display_vendor = display_vendor or _pick_display_vendor(cluster_items) or vendor_key
+        if not display_vendor or _is_generic_billing_provider(display_vendor):
+            return
 
         # Evidence transaction ids (best effort)
         evidence_ids = [
