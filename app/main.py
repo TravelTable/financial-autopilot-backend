@@ -36,19 +36,8 @@ logging.basicConfig(
 
 logger = logging.getLogger("app.main")
 
-
-def _parse_lock_id(value: str | None, default: int) -> int:
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        logger.warning("Invalid MIGRATION_LOCK_ID=%r; falling back to %s", value, default)
-        return default
-
-
 MIGRATIONS_ON_STARTUP = os.getenv("MIGRATIONS_ON_STARTUP", "true").lower() in {"1", "true", "yes"}
-MIGRATION_LOCK_ID = _parse_lock_id(os.getenv("MIGRATION_LOCK_ID"), 4815162342)
+MIGRATION_LOCK_ID = int(os.getenv("MIGRATION_LOCK_ID", "4815162342"))
 
 app = FastAPI(
     title="Financial Autopilot Backend",
