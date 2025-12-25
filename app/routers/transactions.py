@@ -1,5 +1,6 @@
 from __future__ import annotations
-from datetime import date
+
+import datetime as dt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session, load_only
@@ -33,8 +34,8 @@ def list_transactions(
     order_by: str = Query("date_desc", pattern="^(date_desc|date_asc|amount_desc|amount_asc)$"),
     min_amount: float | None = Query(None, ge=0),
     max_amount: float | None = Query(None, ge=0),
-    start_date: date | None = None,
-    end_date: date | None = None,
+    start_date: dt.date | None = None,
+    end_date: dt.date | None = None,
     search: str | None = Query(None, max_length=100),
 ):
     query = (
