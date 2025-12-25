@@ -1,6 +1,6 @@
 from __future__ import annotations
 from datetime import date
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy import select, inspect
@@ -25,6 +25,7 @@ def _transactions_meta_available(db: Session) -> bool:
 @router.get("", response_model=list[TransactionOut])
 @limiter.limit("100/minute")
 def list_transactions(
+    request: Request,
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
     limit: int = Query(50, ge=1, le=MAX_LIMIT),
