@@ -94,7 +94,7 @@ def run_anomaly_checks():
             transactions = (
                 db.query(Transaction)
                 .filter(Transaction.user_id == user.id)
-                .order_by(Transaction.date.desc())
+                .order_by(Transaction.transaction_date.desc())
                 .limit(200)
                 .all()
             )
