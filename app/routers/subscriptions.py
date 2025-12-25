@@ -392,11 +392,37 @@ def list_subscriptions(
 
 
 @router.get("/", response_model=list[SubscriptionOut])
+@limiter.limit("60/minute")
 def list_subscriptions_slash(
+    request: Request,
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
+    limit: int = Query(50, ge=1, le=MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+    order_by: str = Query(
+        "next_renewal_date",
+        pattern="^(next_renewal_date|next_renewal_date_desc|last_charge_date|amount_desc|amount_asc)$",
+    ),
+    min_amount: float | None = Query(None, ge=0),
+    max_amount: float | None = Query(None, ge=0),
+    start_date: date | None = None,
+    end_date: date | None = None,
+    search: str | None = Query(None, max_length=100),
 ):
-    return list_subscriptions(user_id=user_id, db=db)
+    return list_subscriptions(
+        request=request,
+        user_id=user_id,
+        db=db,
+        limit=limit,
+        offset=offset,
+        order_by=order_by,
+        min_amount=min_amount,
+        max_amount=max_amount,
+        start_date=start_date,
+        end_date=end_date,
+        search=search,
+    )
+
 
 
 @router.post("/{subscription_id}/ignore", response_model=dict)
