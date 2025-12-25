@@ -80,6 +80,10 @@ _SUBSCRIPTION_NAME_PATTERNS = (
     re.compile(r"(Subscription|In-App Purchase|Plan)\s*[:#]?\s*(.+)", re.IGNORECASE),
 )
 
+_LINE_ITEM_HINTS = ("subscription", "renewal", "auto-renew", "plan")
+_PRICE_LINE_PATTERN = re.compile(r"(?:[A-Z]{3}|[$€£])\s*\d+[.,]\d{2}")
+_TOTAL_HINTS = ("total", "amount", "billed", "subtotal", "tax")
+
 _SELLER_PATTERNS = (
     re.compile(r"(Seller|Developer)\s*[:#]?\s*(.+)", re.IGNORECASE),
 )
@@ -232,6 +236,13 @@ def parse_apple_receipt(body_text: str, html_text: str | None) -> ParsedAppleRec
     if family_sharing is None and "family sharing" in normalized.lower():
         family_sharing = False
 
+    if app_name is None and subscription_display is None:
+        inferred_name, source_line = _infer_line_item(lines)
+        if inferred_name:
+            subscription_display = _clean_value(inferred_name)
+            raw_signals["subscription_line_item"] = inferred_name
+            raw_signals["subscription_line_item_source"] = source_line
+
     if not any([amount, order_id, app_name, subscription_display, purchase_date]):
         return None
 
@@ -348,6 +359,37 @@ def _normalize_key_part(value: str | None) -> str | None:
     cleaned = re.sub(r"[^a-zA-Z0-9]+", " ", value).strip().lower()
     cleaned = re.sub(r"\s+", "_", cleaned)
     return cleaned or None
+
+
+def _infer_line_item(lines: list[str]) -> tuple[str | None, str | None]:
+    for idx, line in enumerate(lines):
+        lower = line.lower()
+        if any(hint in lower for hint in _LINE_ITEM_HINTS):
+            candidate = _previous_line_item(lines, idx)
+            if candidate:
+                return candidate, line
+    for idx, line in enumerate(lines):
+        if _PRICE_LINE_PATTERN.search(line) and not _looks_like_total(line):
+            candidate = _previous_line_item(lines, idx)
+            if candidate:
+                return candidate, line
+    return None, None
+
+
+def _previous_line_item(lines: list[str], idx: int) -> str | None:
+    for back in range(idx - 1, -1, -1):
+        candidate = lines[back].strip()
+        if not candidate:
+            continue
+        if _looks_like_total(candidate):
+            return None
+        return candidate
+    return None
+
+
+def _looks_like_total(line: str) -> bool:
+    lower = line.lower()
+    return any(hint in lower for hint in _TOTAL_HINTS)
 
 
 def _normalize_currency(value: str | None) -> str | None:
