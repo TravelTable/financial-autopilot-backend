@@ -212,10 +212,10 @@ def _subscription_transactions(
             meta_available=meta_available,
         )
     ]
-        matched.sort(
-            key=lambda x: getattr(x, "transaction_date", None) or dt.date.min,
-            reverse=True,
-        )
+    matched.sort(
+        key=lambda x: getattr(x, "transaction_date", None) or dt.date.min,
+        reverse=True,
+    )
     return matched
 
 
