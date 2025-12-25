@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import datetime as dt
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import and_, or_
