@@ -317,6 +317,29 @@ def _is_bulk_mail(subject: str, snippet: str, text: str) -> bool:
     return _is_newsletter_digest(subject, snippet, text)
 
 
+def _is_valid_subscription_signal(sender: str, subject: str, body: str) -> bool:
+    sender_l = (sender or "").lower()
+    subject_l = (subject or "").lower()
+    body_l = (body or "").lower()
+
+    if "uber" in sender_l and "receipt" in subject_l:
+        allowed_terms = ("uber one", "pass", "membership", "renewal")
+        if not any(term in body_l for term in allowed_terms):
+            return False
+
+    if "lyft" in sender_l and "receipt" in subject_l:
+        allowed_terms = ("lyft pink", "pass", "membership", "renewal")
+        if not any(term in body_l for term in allowed_terms):
+            return False
+
+    if "doordash" in sender_l and "order" in subject_l:
+        allowed_terms = ("dashpass", "pass", "membership", "renewal")
+        if not any(term in body_l for term in allowed_terms):
+            return False
+
+    return True
+
+
 def _subscription_has_concrete_evidence(*, amount: float | None, trial_end: date | None, renewal_date: date | None) -> bool:
     return bool(amount is not None or trial_end or renewal_date)
 
@@ -680,6 +703,21 @@ def sync_user(
                         text_plain = pdf_block
                 text = text_plain or text_html or ""
                 snippet = full.get("snippet", "") or ""
+                if not _is_valid_subscription_signal(
+                    headers.get("from") or idx.from_email or "",
+                    headers.get("subject") or "",
+                    text,
+                ):
+                    logger.info(
+                        "sync_user noise receipt skipped gmail_message_id=%s subject=%s from=%s",
+                        idx.gmail_message_id,
+                        headers.get("subject"),
+                        headers.get("from"),
+                    )
+                    idx.processed = True
+                    idx.processed_at = datetime.now(timezone.utc)
+                    processed += 1
+                    continue
                 extracted = rules_extract(full, text_plain=text_plain, text_html=text_html)
                 service_key = _service_key(headers.get("from") or idx.from_email)
 
