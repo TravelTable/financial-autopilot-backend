@@ -4,6 +4,7 @@ from datetime import date
 from typing import List
 
 from fastapi import APIRouter, Depends
+from fastapi_cache.decorator import cache
 from sqlalchemy.orm import Session
 
 from app.db import get_db
@@ -14,6 +15,7 @@ router = APIRouter(prefix="/analytics", tags=["analytics"])
 
 
 @router.get("/summary")
+@cache(expire=300)
 def get_spending_summary(
     month: int,
     year: int,

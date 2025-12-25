@@ -1,14 +1,18 @@
 from __future__ import annotations
-from fastapi import APIRouter, Depends, HTTPException
+from datetime import date
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session, load_only
 from sqlalchemy import select, inspect
 from app.deps import get_current_user_id
 from app.db import get_db
 from app.models import Transaction
+from app.rate_limit import limiter
 from app.schemas import TransactionOut, ReanalyzeTransactionRequest
 from app.worker.celery_app import celery_app
 
 router = APIRouter(prefix="/transactions", tags=["transactions"])
+MAX_LIMIT = 200
 
 
 def _transactions_meta_available(db: Session) -> bool:
@@ -19,12 +23,48 @@ def _transactions_meta_available(db: Session) -> bool:
         return False
 
 @router.get("", response_model=list[TransactionOut])
-def list_transactions(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+@limiter.limit("100/minute")
+def list_transactions(
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+    limit: int = Query(50, ge=1, le=MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+    order_by: str = Query("date_desc", pattern="^(date_desc|date_asc|amount_desc|amount_asc)$"),
+    min_amount: float | None = Query(None, ge=0),
+    max_amount: float | None = Query(None, ge=0),
+    start_date: date | None = None,
+    end_date: date | None = None,
+    search: str | None = Query(None, max_length=100),
+):
     query = (
         select(Transaction)
         .where(Transaction.user_id == user_id)
-        .order_by(Transaction.transaction_date.desc().nullslast(), Transaction.id.desc())
     )
+    filters = []
+    if min_amount is not None:
+        filters.append(Transaction.amount >= min_amount)
+    if max_amount is not None:
+        filters.append(Transaction.amount <= max_amount)
+    if start_date is not None:
+        filters.append(Transaction.transaction_date >= start_date)
+    if end_date is not None:
+        filters.append(Transaction.transaction_date <= end_date)
+    if search:
+        like = f"%{search}%"
+        filters.append(or_(Transaction.vendor.ilike(like), Transaction.category.ilike(like)))
+    if filters:
+        query = query.where(and_(*filters))
+
+    if order_by == "date_asc":
+        order_clause = Transaction.transaction_date.asc().nullslast()
+    elif order_by == "amount_desc":
+        order_clause = Transaction.amount.desc().nullslast()
+    elif order_by == "amount_asc":
+        order_clause = Transaction.amount.asc().nullslast()
+    else:
+        order_clause = Transaction.transaction_date.desc().nullslast()
+
+    query = query.order_by(order_clause, Transaction.id.desc()).limit(limit).offset(offset)
     if not _transactions_meta_available(db):
         query = query.options(
             load_only(

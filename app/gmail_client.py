@@ -19,3 +19,12 @@ def list_messages(service, query: str, page_token: str | None = None, max_result
 
 def get_message(service, message_id: str, format: str = "full") -> dict:
     return service.users().messages().get(userId="me", id=message_id, format=format).execute()
+
+def get_attachment(service, message_id: str, attachment_id: str) -> dict:
+    return (
+        service.users()
+        .messages()
+        .attachments()
+        .get(userId="me", messageId=message_id, id=attachment_id)
+        .execute()
+    )
