@@ -1,6 +1,4 @@
-from __future__ import annotations
-
-from datetime import date
+import datetime as dt
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -89,7 +87,7 @@ def _get_meta(s: Subscription) -> dict:
     return {}
 
 
-def _parse_date_maybe(v: Any) -> Optional[date]:
+def _parse_date_maybe(v: Any) -> Optional[dt.date]:
     """
     JSON meta may store dates as ISO strings. Accept:
     - date
@@ -97,11 +95,11 @@ def _parse_date_maybe(v: Any) -> Optional[date]:
     """
     if v is None:
         return None
-    if isinstance(v, date):
+    if isinstance(v, dt.date):
         return v
     if isinstance(v, str):
         try:
-            return date.fromisoformat(v.strip()[:10])
+            return dt.date.fromisoformat(v.strip()[:10])
         except Exception:
             return None
     return None
@@ -214,10 +212,10 @@ def _subscription_transactions(
             meta_available=meta_available,
         )
     ]
-    matched.sort(
-        key=lambda x: getattr(x, "transaction_date", None) or date.min,
-        reverse=True,
-    )
+        matched.sort(
+            key=lambda x: getattr(x, "transaction_date", None) or dt.date.min,
+            reverse=True,
+        )
     return matched
 
 
@@ -278,8 +276,8 @@ def list_subscriptions(
     ),
     min_amount: float | None = Query(None, ge=0),
     max_amount: float | None = Query(None, ge=0),
-    start_date: date | None = None,
-    end_date: date | None = None,
+    start_date: dt.date | None = None,
+    end_date: dt.date | None = None,
     search: str | None = Query(None, max_length=100),
 ):
     query = select(Subscription).where(Subscription.user_id == user_id)
