@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import and_, or_, select, inspect
 from sqlalchemy.orm import Session, load_only
 
@@ -267,6 +267,7 @@ def _compute_product_fields(
 @router.get("", response_model=list[SubscriptionOut])
 @limiter.limit("60/minute")
 def list_subscriptions(
+    request: Request,
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
     limit: int = Query(50, ge=1, le=MAX_LIMIT),
