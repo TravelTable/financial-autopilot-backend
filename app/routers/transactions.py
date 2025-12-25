@@ -7,7 +7,7 @@ from app.deps import get_current_user_id
 from app.db import get_db
 from app.models import Transaction
 from app.rate_limit import limiter
-from app.schemas import TransactionOut, ReanalyzeTransactionRequest
+from app.schemas import TransactionOut, ReanalyzeTransactionRequest, ReceiptEvidenceOut
 from app.worker.celery_app import celery_app
 
 router = APIRouter(prefix="/transactions", tags=["transactions"])
@@ -20,6 +20,55 @@ def _transactions_meta_available(db: Session) -> bool:
         return "meta" in columns
     except Exception:
         return False
+
+
+def _receipt_confidence(confidence: dict | None) -> float | None:
+    if not isinstance(confidence, dict):
+        return None
+    values: list[float] = []
+    for key in ("amount", "date"):
+        val = confidence.get(key)
+        if isinstance(val, (int, float)):
+            values.append(float(val))
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def _build_receipt(tx: Transaction) -> ReceiptEvidenceOut | None:
+    meta = getattr(tx, "meta", None)
+    if not isinstance(meta, dict):
+        meta = {}
+    apple_meta = meta.get("apple")
+    billing_provider = meta.get("billing_provider")
+
+    receipt_confidence = _receipt_confidence(getattr(tx, "confidence", None))
+    has_receipt = bool(apple_meta or billing_provider or (receipt_confidence is not None and receipt_confidence >= 0.5))
+    if not has_receipt:
+        return None
+
+    purchase_date = None
+    if isinstance(apple_meta, dict):
+        purchase_date_raw = apple_meta.get("purchase_date_utc")
+        if isinstance(purchase_date_raw, str):
+            try:
+                purchase_date = dt.datetime.fromisoformat(purchase_date_raw)
+            except ValueError:
+                purchase_date = None
+
+    return ReceiptEvidenceOut(
+        has_receipt=True,
+        provider="apple" if isinstance(apple_meta, dict) else None,
+        billing_provider=billing_provider if isinstance(billing_provider, str) else None,
+        order_id=apple_meta.get("order_id") if isinstance(apple_meta, dict) else None,
+        original_order_id=apple_meta.get("original_order_id") if isinstance(apple_meta, dict) else None,
+        purchase_date_utc=purchase_date,
+        country=apple_meta.get("country") if isinstance(apple_meta, dict) else None,
+        family_sharing=apple_meta.get("family_sharing") if isinstance(apple_meta, dict) else None,
+        app_name=apple_meta.get("app_name") if isinstance(apple_meta, dict) else None,
+        subscription_display_name=apple_meta.get("subscription_display_name") if isinstance(apple_meta, dict) else None,
+        developer_or_seller=apple_meta.get("developer_or_seller") if isinstance(apple_meta, dict) else None,
+    )
 
 @router.get("", response_model=list[TransactionOut])
 @limiter.limit("100/minute")
@@ -36,6 +85,7 @@ def list_transactions(
     end_date: dt.date | None = None,
     search: str | None = Query(None, max_length=100),
 ):
+    meta_available = _transactions_meta_available(db)
     query = (
         select(Transaction)
         .where(Transaction.user_id == user_id)
@@ -65,7 +115,7 @@ def list_transactions(
         order_clause = Transaction.transaction_date.desc().nullslast()
 
     query = query.order_by(order_clause, Transaction.id.desc()).limit(limit).offset(offset)
-    if not _transactions_meta_available(db):
+    if not meta_available:
         query = query.options(
             load_only(
                 Transaction.id,
@@ -81,21 +131,27 @@ def list_transactions(
             )
         )
     txs = db.execute(query).scalars().all()
-    return [
-        TransactionOut(
-            id=t.id,
-            gmail_message_id=t.gmail_message_id,
-            vendor=t.vendor,
-            amount=float(t.amount) if t.amount is not None else None,
-            currency=t.currency,
-            transaction_date=t.transaction_date,
-            category=t.category,
-            is_subscription=bool(t.is_subscription),
-            trial_end_date=t.trial_end_date,
-            renewal_date=t.renewal_date,
+    results = []
+    for t in txs:
+        receipt_confidence = _receipt_confidence(getattr(t, "confidence", None))
+        receipt = _build_receipt(t) if meta_available else None
+        results.append(
+            TransactionOut(
+                id=t.id,
+                gmail_message_id=t.gmail_message_id,
+                vendor=t.vendor,
+                amount=float(t.amount) if t.amount is not None else None,
+                currency=t.currency,
+                transaction_date=t.transaction_date,
+                category=t.category,
+                is_subscription=bool(t.is_subscription),
+                trial_end_date=t.trial_end_date,
+                renewal_date=t.renewal_date,
+                receipt=receipt,
+                receipt_confidence=receipt_confidence,
+            )
         )
-        for t in txs
-    ]
+    return results
 
 
 @router.post("/{transaction_id}/reanalyze", response_model=dict)

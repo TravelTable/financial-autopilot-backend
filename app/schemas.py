@@ -43,6 +43,8 @@ class TransactionOut(BaseModel):
     is_subscription: bool
     trial_end_date: dt.date | None
     renewal_date: dt.date | None
+    receipt: ReceiptEvidenceOut | None = None
+    receipt_confidence: float | None = None
 
 
 class ReanalyzeTransactionRequest(BaseModel):
@@ -124,3 +126,59 @@ class SubscriptionInsightsOut(BaseModel):
 
     # Proof (last charges)
     evidence_charges: list[EvidenceChargeOut] = Field(default_factory=list)
+
+
+class ReceiptEvidenceOut(BaseModel):
+    has_receipt: bool
+    provider: str | None = None
+    billing_provider: str | None = None
+    order_id: str | None = None
+    original_order_id: str | None = None
+    purchase_date_utc: dt.datetime | None = None
+    country: str | None = None
+    family_sharing: bool | None = None
+    app_name: str | None = None
+    subscription_display_name: str | None = None
+    developer_or_seller: str | None = None
+
+
+class SpendingByCategoryOut(BaseModel):
+    category: str
+    total: float
+
+
+class SpendingByVendorOut(BaseModel):
+    vendor: str
+    total: float
+    transaction_count: int
+    receipt_coverage_rate: float
+
+
+class SpendingSeriesPointOut(BaseModel):
+    year: int
+    month: int
+    total: float
+    subscription_total: float
+    general_total: float
+    transaction_count: int
+    receipt_coverage_rate: float
+
+
+class SpendingOverviewOut(BaseModel):
+    start_date: date | None
+    end_date: date | None
+    total_spend: float
+    subscription_spend: float
+    general_spend: float
+    subscription_share: float
+    transaction_count: int
+    subscription_count: int
+    general_count: int
+    receipt_transaction_count: int
+    receipt_coverage_rate: float
+    receipt_spend: float
+    average_transaction: float | None = None
+    largest_transaction: float | None = None
+    by_category: list[SpendingByCategoryOut] = Field(default_factory=list)
+    by_vendor: list[SpendingByVendorOut] = Field(default_factory=list)
+    monthly_series: list[SpendingSeriesPointOut] = Field(default_factory=list)
