@@ -1,5 +1,5 @@
 from datetime import datetime
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, select
 
@@ -14,6 +14,7 @@ MAX_LIMIT = 200
 @router.get("")
 @limiter.limit("60/minute")
 def list_notifications(
+    request: Request,
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
     limit: int = Query(50, ge=1, le=MAX_LIMIT),
