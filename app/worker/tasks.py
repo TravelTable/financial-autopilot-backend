@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import logging
 import re
 import time
@@ -15,7 +17,9 @@ from app.alerts import schedule_alerts
 from app.config import settings
 from app.db import SessionLocal
 from app.extraction import extract_headers, get_html_parts, get_plain_text_parts, rules_extract
-from app.gmail_client import build_gmail_service, get_message, list_messages
+from pypdf import PdfReader
+
+from app.gmail_client import build_gmail_service, get_attachment, get_message, list_messages
 from app.llm import get_llm
 from app.models import AuditLog, EmailIndex, EmailRaw, GoogleAccount, Transaction
 from app.security import token_cipher
@@ -146,6 +150,77 @@ _GENERIC_BILLING_PROVIDERS = {
     "stripe",
     "microsoft",
 }
+
+_EMAIL_DOMAIN_REGEX = re.compile(r"@([A-Za-z0-9\.-]+\.[A-Za-z]{2,})")
+_MAX_PDF_BYTES = 5 * 1024 * 1024
+_PDF_ATTACHMENT_MARKER = "[PDF_ATTACHMENT_TEXT]"
+
+
+def _service_key(from_email: str | None) -> str | None:
+    if not from_email:
+        return None
+    match = _EMAIL_DOMAIN_REGEX.search(from_email)
+    if match:
+        return match.group(1).lower()
+    fallback = from_email.split("<")[0].strip().lower()
+    return fallback or None
+
+
+def _iter_payload_parts(payload: dict) -> list[dict]:
+    parts: list[dict] = []
+    stack = [payload]
+    while stack:
+        part = stack.pop()
+        if not isinstance(part, dict):
+            continue
+        parts.append(part)
+        stack.extend(part.get("parts", []) or [])
+    return parts
+
+
+def _pdf_bytes_to_text(pdf_bytes: bytes) -> str:
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+    except Exception:
+        return ""
+    text_chunks: list[str] = []
+    for page in reader.pages:
+        try:
+            page_text = page.extract_text() or ""
+        except Exception:
+            page_text = ""
+        if page_text:
+            text_chunks.append(page_text)
+    return "\n".join(text_chunks).strip()
+
+
+def _extract_pdf_text_from_payload(*, svc, message_id: str, payload: dict) -> str:
+    texts: list[str] = []
+    for part in _iter_payload_parts(payload):
+        mime = (part.get("mimeType") or "").lower()
+        filename = (part.get("filename") or "").lower()
+        if mime != "application/pdf" and not filename.endswith(".pdf"):
+            continue
+        body = part.get("body", {}) or {}
+        data = body.get("data")
+        if not data and body.get("attachmentId"):
+            attachment = get_attachment(svc, message_id, body["attachmentId"])
+            data = attachment.get("data")
+        if not data:
+            continue
+        try:
+            pdf_bytes = base64.urlsafe_b64decode(data.encode("utf-8"))
+        except Exception:
+            continue
+        if len(pdf_bytes) > _MAX_PDF_BYTES:
+            logger.info("sync_user pdf attachment skipped (too large) message_id=%s", message_id)
+            continue
+        pdf_text = _pdf_bytes_to_text(pdf_bytes)
+        if pdf_text:
+            texts.append(pdf_text)
+    if not texts:
+        return ""
+    return "\n\n".join(texts)
 
 
 def _is_generic_billing_provider(vendor: str | None) -> bool:
@@ -560,11 +635,13 @@ def sync_user(
             pending_query = pending_query.where(EmailIndex.processed.is_(False))
 
         pending = db.execute(pending_query).scalars().all()
+        pending.sort(key=lambda item: item.internal_date_ms or 0)
         logger.info("sync_user pending emails=%s force_reprocess=%s", len(pending), force_reprocess)
 
         processed = 0
         tx_created = 0
         batch_count = 0
+        service_subscription_found: set[str] = set()
 
         for idx in pending:
             try:
@@ -589,10 +666,22 @@ def sync_user(
                 payload = full.get("payload", {}) or {}
                 text_plain = get_plain_text_parts(payload) or ""
                 text_html = get_html_parts(payload) or ""
-                text = text_plain or text_html or ""
                 headers = extract_headers(full)
+                pdf_text = _extract_pdf_text_from_payload(
+                    svc=svc,
+                    message_id=idx.gmail_message_id,
+                    payload=payload,
+                )
+                if pdf_text:
+                    pdf_block = f"{_PDF_ATTACHMENT_MARKER}\n{pdf_text}"
+                    if text_plain:
+                        text_plain = f"{text_plain}\n\n{pdf_block}"
+                    else:
+                        text_plain = pdf_block
+                text = text_plain or text_html or ""
                 snippet = full.get("snippet", "") or ""
                 extracted = rules_extract(full, text_plain=text_plain, text_html=text_html)
+                service_key = _service_key(headers.get("from") or idx.from_email)
 
                 if _is_bulk_mail(headers.get("subject") or "", snippet, text):
                     logger.info(
@@ -694,6 +783,10 @@ def sync_user(
                             text_html=text_html,
                         )
                     )
+                elif pdf_text and _PDF_ATTACHMENT_MARKER not in (raw_exists.text_plain or ""):
+                    raw_exists.text_plain = "\n\n".join(
+                        filter(None, [raw_exists.text_plain or "", f"{_PDF_ATTACHMENT_MARKER}\n{pdf_text}"])
+                    )
 
                 llm_used = False
                 llm_error = None
@@ -769,6 +862,13 @@ def sync_user(
                     amount=amount, trial_end=trial_end, renewal_date=renewal_date
                 ):
                     is_subscription = False
+                subscription_suppressed_reason = None
+                if is_subscription and service_key:
+                    if service_key in service_subscription_found:
+                        is_subscription = False
+                        subscription_suppressed_reason = "prior_service_subscription"
+                    else:
+                        service_subscription_found.add(service_key)
                 if not billing_provider and raw_vendor and vendor and raw_vendor != vendor:
                     if _is_generic_billing_provider(raw_vendor):
                         billing_provider = raw_vendor
@@ -785,6 +885,8 @@ def sync_user(
                     conf_obj["llm_classification"] = "not_receipt"
                 if extracted.get("is_subscription") and not is_subscription:
                     conf_obj["subscription_downgraded"] = "missing_amount_or_dates"
+                if subscription_suppressed_reason:
+                    conf_obj["subscription_downgraded"] = subscription_suppressed_reason
 
                 meta: dict[str, Any] | None = None
                 if apple_meta or billing_provider:

@@ -3,13 +3,14 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select, inspect
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import and_, or_, select, inspect
 from sqlalchemy.orm import Session, load_only
 
 from app.deps import get_current_user_id
 from app.db import get_db
 from app.models import Subscription, SubscriptionStatus
+from app.rate_limit import limiter
 from app.schemas import SubscriptionOut, SubscriptionInsightsOut, EvidenceChargeOut
 
 # Transaction model might exist in app.models
@@ -21,6 +22,7 @@ except Exception:  # pragma: no cover
 
 
 router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
+MAX_LIMIT = 200
 
 
 # -----------------------------
@@ -263,17 +265,51 @@ def _compute_product_fields(
 # -----------------------------
 
 @router.get("", response_model=list[SubscriptionOut])
+@limiter.limit("60/minute")
 def list_subscriptions(
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
+    limit: int = Query(50, ge=1, le=MAX_LIMIT),
+    offset: int = Query(0, ge=0),
+    order_by: str = Query(
+        "next_renewal_date",
+        pattern="^(next_renewal_date|next_renewal_date_desc|last_charge_date|amount_desc|amount_asc)$",
+    ),
+    min_amount: float | None = Query(None, ge=0),
+    max_amount: float | None = Query(None, ge=0),
+    start_date: date | None = None,
+    end_date: date | None = None,
+    search: str | None = Query(None, max_length=100),
 ):
+    query = select(Subscription).where(Subscription.user_id == user_id)
+    filters = []
+    if min_amount is not None:
+        filters.append(Subscription.amount >= min_amount)
+    if max_amount is not None:
+        filters.append(Subscription.amount <= max_amount)
+    if start_date is not None:
+        filters.append(Subscription.last_charge_date >= start_date)
+    if end_date is not None:
+        filters.append(Subscription.last_charge_date <= end_date)
+    if search:
+        like = f"%{search}%"
+        filters.append(or_(Subscription.vendor_name.ilike(like)))
+    if filters:
+        query = query.where(and_(*filters))
+
+    if order_by == "next_renewal_date_desc":
+        order_clause = Subscription.next_renewal_date.desc().nullslast()
+    elif order_by == "last_charge_date":
+        order_clause = Subscription.last_charge_date.desc().nullslast()
+    elif order_by == "amount_desc":
+        order_clause = Subscription.amount.desc().nullslast()
+    elif order_by == "amount_asc":
+        order_clause = Subscription.amount.asc().nullslast()
+    else:
+        order_clause = Subscription.next_renewal_date.asc().nullslast()
+
     subs = db.execute(
-        select(Subscription)
-        .where(Subscription.user_id == user_id)
-        .order_by(
-            Subscription.next_renewal_date.asc().nullslast(),
-            Subscription.id.desc(),
-        )
+        query.order_by(order_clause, Subscription.id.desc()).limit(limit).offset(offset)
     ).scalars().all()
 
     txs: list[Any] = []
@@ -325,11 +361,15 @@ def list_subscriptions(
             txs,
             meta_available=meta_available,
         )
+        subheader = None
+        if provider:
+            subheader = product_name or product_id
 
         results.append(
             SubscriptionOut(
                 id=s.id,
                 vendor_name=s.vendor_name,
+                subheader=subheader,
                 amount=_safe_float(s.amount),
                 currency=s.currency,
                 billing_cycle_days=s.billing_cycle_days,

@@ -104,6 +104,42 @@ def _meets_confidence(tx: Transaction, key: str, minimum: float | None) -> bool:
         return True
 
 
+def _is_subscription_downgraded(tx: Transaction) -> bool:
+    confidence = getattr(tx, "confidence", None)
+    if not isinstance(confidence, dict):
+        return False
+    return bool(confidence.get("subscription_downgraded"))
+
+
+def _has_strong_receipt_evidence(tx: Transaction) -> bool:
+    amount = _amount_to_float(getattr(tx, "amount", None))
+    date_val = getattr(tx, "transaction_date", None)
+    if amount is None or date_val is None:
+        return False
+    return _meets_confidence(tx, "amount", _MIN_EVIDENCE_CONFIDENCE) and _meets_confidence(
+        tx, "date", _MIN_EVIDENCE_CONFIDENCE
+    )
+
+
+def _is_strong_subscription_signal(tx: Transaction) -> bool:
+    if _is_subscription_downgraded(tx):
+        return False
+    if getattr(tx, "trial_end_date", None) or getattr(tx, "renewal_date", None):
+        return _meets_confidence(tx, "date", _MIN_EVIDENCE_CONFIDENCE)
+    if getattr(tx, "is_subscription", False) and _has_strong_receipt_evidence(tx):
+        return True
+    meta = getattr(tx, "meta", None)
+    if isinstance(meta, dict):
+        apple_meta = meta.get("apple")
+        if isinstance(apple_meta, dict):
+            if apple_meta.get("subscription_display_name") or apple_meta.get("app_name"):
+                return True
+            raw_signals = apple_meta.get("raw_signals") or {}
+            if isinstance(raw_signals, dict) and raw_signals.get("subscription_terms"):
+                return True
+    return False
+
+
 def _cluster_by_amount(
     items: list[Transaction],
     *,
@@ -240,6 +276,7 @@ def _confidence_and_reasons(
     amount_variability: float | None,
     skipped_cycles: int,
     flagged_count: int,
+    strong_receipt_count: int,
     last_date,
     amount_median: float | None,
 ) -> tuple[float, list[str]]:
@@ -272,6 +309,9 @@ def _confidence_and_reasons(
     if flagged_count > 0:
         score += 0.15
         reasons.append("At least one email/transaction was flagged as subscription/trial/renewal.")
+    if strong_receipt_count > 0:
+        score += 0.10
+        reasons.append(f"{strong_receipt_count} charge(s) have strong receipt evidence.")
 
     if last_date:
         score += 0.10
@@ -391,12 +431,8 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
             return
 
         # Flagged evidence from extraction/LLM
-        flagged = [
-            t for t in cluster_items
-            if getattr(t, "is_subscription", False)
-            or getattr(t, "trial_end_date", None)
-            or getattr(t, "renewal_date", None)
-        ]
+        flagged = [t for t in cluster_items if _is_strong_subscription_signal(t)]
+        strong_receipt_count = sum(1 for t in cluster_items if _has_strong_receipt_evidence(t))
 
         amount_evidence = any(
             _amount_to_float(getattr(t, "amount", None)) is not None
@@ -422,7 +458,7 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
             median_gap = None
 
         if len(dates) == 1:
-            if not (trial_evidence or renewal_evidence):
+            if not (trial_evidence or renewal_evidence or strong_receipt_count):
                 return
         elif median_gap is None:
             if not concrete_evidence:
@@ -442,7 +478,8 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
         amount_variability = _amount_variability(amounts) if amounts else None
         if not flagged and not subscription_key:
             if len(dates) < 3 or median_gap is None:
-                return
+                if strong_receipt_count < 2:
+                    return
             if amount_variability is None or amount_variability > max(0.5, amount_median * 0.05):
                 return
 
@@ -503,6 +540,7 @@ def recompute_subscriptions(db: Session, *, user_id: int) -> None:
             amount_variability=amount_variability,
             skipped_cycles=skipped_cycles,
             flagged_count=len(flagged),
+            strong_receipt_count=strong_receipt_count,
             last_date=last_date,
             amount_median=amount_median,
         )

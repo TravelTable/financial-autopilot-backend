@@ -51,6 +51,7 @@ class ReanalyzeTransactionRequest(BaseModel):
 class SubscriptionOut(BaseModel):
     id: int
     vendor_name: str
+    subheader: str | None = None
     amount: float | None
     currency: str | None
     billing_cycle_days: int | None
